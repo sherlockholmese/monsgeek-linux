@@ -1,0 +1,17 @@
+_manual=/etc/udev/rules.d/70-monsgeek-m1w.rules
+
+_note_manual_rule() {
+  if [ -e "$_manual" ]; then
+    echo ":: $_manual overrides the packaged rule in /usr/lib/udev/rules.d."
+    echo "   Remove it to use the packaged version: sudo rm $_manual"
+  fi
+}
+
+post_install() {
+  _note_manual_rule
+  echo ":: Reconnect the keyboard or receiver if access is still denied."
+}
+
+post_upgrade() {
+  _note_manual_rule
+}

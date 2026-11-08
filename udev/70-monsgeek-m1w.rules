@@ -1,0 +1,23 @@
+# Original M1W configuration and shared experimental boot interfaces.
+# No world-writable keyboard devices.
+# Match USB device and interface in separate rules: ATTRS and KERNELS in a
+# single rule would have to match the same ancestor, which these do not.
+
+# USB cable (3151:4015) and 2.4 GHz receiver (3151:4011), interface 2 only.
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4015|4011", ENV{MONSGEEK_M1W_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ENV{MONSGEEK_M1W_CANDIDATE}=="1", KERNELS=="*:1.2", TAG+="uaccess"
+
+# Bluetooth LE (bus 0005). BlueZ exposes one hidraw node per device carrying
+# every collection, so this also grants the active login the key reports of
+# that keyboard. Remove this line if you do not configure over Bluetooth.
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:3151:*", TAG+="uaccess"
+
+# Experimental firmware boot interfaces from the vendor bootKeyboard filters.
+# Shared boot IDs are not model identities; the updater also checks the original USB port.
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c45", ATTRS{idProduct}=="7040", ENV{MONSGEEK_BOOT_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25a7", ATTRS{idProduct}=="2300", ENV{MONSGEEK_BOOT_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0461", ATTRS{idProduct}=="4001", ENV{MONSGEEK_BOOT_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4001|400d|4016|4019|401a|4036|403b|5001|5024|502a|5047|5049|504d|5057", ENV{MONSGEEK_BOOT_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="4353", ATTRS{idProduct}=="8008", ENV{MONSGEEK_BOOT_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="25aa", ATTRS{idProduct}=="2009|200a|200b|200c|8003", ENV{MONSGEEK_BOOT_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ENV{MONSGEEK_BOOT_CANDIDATE}=="1", KERNELS=="*:1.0", TAG+="uaccess"

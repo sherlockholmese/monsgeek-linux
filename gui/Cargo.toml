@@ -1,0 +1,19 @@
+[package]
+name = "monsgeek-gui"
+version = "0.1.0"
+edition = "2024"
+description = "Native GPUI configurator for the original MonsGeek M1W"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+gpui-kit = "0.9"
+hidapi = { version = "2.6", default-features = false, features = ["linux-native"] }
+monsgeek-linux = { path = ".." }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+gpui-platform = { package = "gpui-pre-platform", version = "=0.3.11", features = ["test-support"] }
+gpui = { package = "gpui-pre", version = "=0.3.11", features = ["test-support"] }

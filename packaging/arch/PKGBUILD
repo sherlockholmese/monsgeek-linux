@@ -1,0 +1,92 @@
+# Builds from this source tree (no release tarball is published yet).
+# From packaging/arch: makepkg -si
+#
+# Two packages: the CLI with the udev access rule, and the GPUI app.
+
+pkgbase=monsgeek-linux
+pkgname=(monsgeek-linux monsgeek-linux-gui)
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='Userspace configurator for the original MonsGeek M1W keyboard'
+arch=('x86_64' 'aarch64')
+license=('MIT')
+makedepends=('cargo' 'pkgconf')
+
+_tree="$(realpath "$startdir/../..")"
+
+prepare() {
+  # Copy only what the build needs: never build output or the vendor
+  # research material under .amp/.
+  rm -rf "$srcdir/$pkgbase"
+  mkdir -p "$srcdir/$pkgbase"
+  cp -a "$_tree"/{Cargo.toml,Cargo.lock,LICENSE,README.md,src,gui,udev,docs,tests} \
+    "$srcdir/$pkgbase/"
+  # Not the whole packaging/ folder: makepkg's own build directory lives in it.
+  install -Dm644 "$_tree"/packaging/monsgeek-linux.{desktop,svg} \
+    -t "$srcdir/$pkgbase/packaging/"
+
+  cd "$srcdir/$pkgbase"
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+_env() {
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Keep build paths (e.g. generated code under OUT_DIR) out of the binaries.
+  export RUSTFLAGS="${RUSTFLAGS:-} --remap-path-prefix=$srcdir=/build"
+}
+
+build() {
+  cd "$srcdir/$pkgbase"
+  _env
+  cargo build --frozen --release --workspace
+}
+
+check() {
+  cd "$srcdir/$pkgbase"
+  _env
+  # The library and CLI. The GUI's headless tests need GPUI's test-support
+  # build, a second full GPUI compile; run them with `cargo test -p monsgeek-gui`.
+  cargo test --frozen --release -p monsgeek-linux
+}
+
+package_monsgeek-linux() {
+  pkgdesc='Configurator for the original MonsGeek M1W keyboard: CLI and device access rule'
+  depends=('gcc-libs' 'glibc' 'systemd-libs')
+  install=monsgeek-linux.install
+
+  cd "$srcdir/$pkgbase"
+  install -Dm755 target/release/monsgeek-linux -t "$pkgdir/usr/bin/"
+  # pacman's udev hook reloads rules and re-applies them to connected devices.
+  install -Dm644 udev/70-monsgeek-m1w.rules -t "$pkgdir/usr/lib/udev/rules.d/"
+  install -Dm644 README.md -t "$pkgdir/usr/share/doc/$pkgname/"
+  install -Dm644 docs/*.md -t "$pkgdir/usr/share/doc/$pkgname/docs/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+}
+
+package_monsgeek-linux-gui() {
+  pkgdesc='Graphical configurator for the original MonsGeek M1W keyboard'
+  license=('MIT' 'OFL-1.1')
+  depends=(
+    "monsgeek-linux=$pkgver-$pkgrel"
+    'gcc-libs'
+    'glibc'
+    'libxcb'
+    'libxkbcommon'
+    'libxkbcommon-x11'
+    'systemd-libs'
+    'vulkan-driver'
+    'vulkan-icd-loader'
+    'wayland'
+  )
+  optdepends=('polkit: password prompt when a manually installed access rule is outdated')
+
+  cd "$srcdir/$pkgbase"
+  install -Dm755 target/release/monsgeek-gui -t "$pkgdir/usr/bin/"
+  install -Dm644 packaging/monsgeek-linux.desktop -t "$pkgdir/usr/share/applications/"
+  install -Dm644 packaging/monsgeek-linux.svg -t "$pkgdir/usr/share/icons/hicolor/scalable/apps/"
+  install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+  # Geist and Geist Mono are compiled into the binary.
+  install -Dm644 gui/assets/fonts/OFL.txt "$pkgdir/usr/share/licenses/$pkgname/Geist-OFL.txt"
+}
