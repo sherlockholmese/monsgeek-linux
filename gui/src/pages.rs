@@ -36,6 +36,9 @@ pub fn render(
     window: &mut Window,
     cx: &mut Context<Workbench>,
 ) -> AnyElement {
+    if let Some(page) = crate::features::render(this, window, cx) {
+        return page;
+    }
     if this.page == Page::Logs {
         return logs(this, cx);
     }
@@ -53,6 +56,7 @@ pub fn render(
         Page::System => system(this, cx),
         Page::Backups => backups(this, cx),
         Page::Logs => unreachable!(),
+        Page::Profiles | Page::Review | Page::Tester | Page::Desktop | Page::Host => unreachable!(),
     }
 }
 
@@ -1043,6 +1047,15 @@ fn system(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
                         path.file_name().unwrap_or_default().to_string_lossy(),
                         image.info().file_bytes
                     )))
+                    .child(div().text_sm().child(
+                        match &image.info().known_release {
+                            Some(release) => format!(
+                                "Known original M1W ID{} vendor image {} · exact hash match",
+                                release.device_id, release.version
+                            ),
+                            None => "Unrecognized image · its model cannot be checked".into(),
+                        },
+                    ))
                 })
                 .child(
                     h_flex()
@@ -1191,6 +1204,7 @@ fn backups(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
     ui::page(
         "backups",
         vec![
+            crate::features::picture_controls(this, cx),
             h_flex()
                 .child(ui::heading("Snapshot", cx))
                 .child(div().flex_1())

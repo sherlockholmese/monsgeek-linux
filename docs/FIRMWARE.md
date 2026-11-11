@@ -10,8 +10,12 @@ not interchangeable. ZIP/raw-deflate downloads must be decompressed first.
 Automatic downloads, RF/receiver updates and already-booted recovery are not
 implemented. No firmware is bundled.
 
-The reference skips the first65536 bytes. We have not established a model or
-signature schema in that prefix. The parser checks size and protocol bounds,
+The reference skips the first65536 bytes. Initial analysis of the downloaded
+ID983 v108 package found a bundled bootloader and padding in this prefix; see
+[the firmware and QMK/VIA research](QMK-VIA-RESEARCH.md) for acquisition, hashes,
+memory mapping and the bundled bootloader's descriptors. Its presence does not
+prove which bootloader is installed on a keyboard. We have not established a
+model-authentication or signature schema in the prefix. The parser checks size and protocol bounds,
 not image authenticity or model compatibility. The preview explicitly reports
 `image_model_verified: false`. SHA-256 pins the exact selected file; it does not
 prove that the file belongs to this keyboard.

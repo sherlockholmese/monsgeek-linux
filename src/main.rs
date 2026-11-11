@@ -36,6 +36,30 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage named local profiles without accessing hardware.
+    Profiles {
+        #[command(subcommand)]
+        command: ProfilesCommand,
+    },
+    /// Human-readable offline differences between two snapshots.
+    Review {
+        current: PathBuf,
+        target: PathBuf,
+    },
+    /// Export a privacy-preserving support report; no keymaps or macros.
+    Diagnostics {
+        #[arg(long)]
+        snapshot: Option<PathBuf>,
+    },
+    /// Capture all three RGB pictures. Apply temporarily changes picture selection.
+    Pictures {
+        file: PathBuf,
+    },
+    /// Optional Linux-side tap-hold, tap dance, chords and application rules.
+    Host {
+        #[command(subcommand)]
+        command: HostCommand,
+    },
     /// Experimental USB firmware update. Preview only unless --apply is given.
     Firmware {
         /// Decompressed vendor firmwareFile.bin for original M1W (ID983).
@@ -161,6 +185,184 @@ enum Command {
     },
     /// List source slots and concrete vendor defaults, not current assignments.
     Keys,
+}
+
+#[derive(Subcommand)]
+enum ProfilesCommand {
+    List,
+    Save {
+        name: String,
+        snapshot: PathBuf,
+    },
+    Duplicate {
+        file: PathBuf,
+        name: String,
+    },
+    /// Produce a snapshot draft; use restore to preview/apply it separately.
+    Draft {
+        file: PathBuf,
+        current: PathBuf,
+        output: PathBuf,
+        #[arg(long, value_delimiter = ',', value_parser = ["keys", "macros", "lighting", "performance", "options", "active-layer"])]
+        only: Vec<String>,
+    },
+}
+#[derive(Subcommand)]
+enum HostCommand {
+    Devices,
+    Example {
+        file: PathBuf,
+    },
+    Check {
+        file: PathBuf,
+    },
+    /// Prints a summary unless --activate explicitly permits input grabbing.
+    Run {
+        file: PathBuf,
+        #[arg(long)]
+        activate: bool,
+    },
+    /// Query supported desktop focus providers without capturing input.
+    Focus,
+}
+
+fn local_command(args: &Args) -> Option<Result<()>> {
+    use monsgeek_linux::{diagnostics, host, pictures, profiles, review};
+    Some((|| -> Result<()> {
+        match &args.command {
+            Command::Profiles { command } => {
+                ensure!(
+                    !args.apply,
+                    "Profiles only stage local data; use restore to apply a generated draft"
+                );
+                let dir = profiles::directory()?;
+                match command {
+                    ProfilesCommand::List => {
+                        for (path, p) in profiles::list(&dir)? {
+                            println!("{}\t{}", p.name, path.display());
+                        }
+                    }
+                    ProfilesCommand::Save { name, snapshot } => println!(
+                        "{}",
+                        profiles::save(
+                            &dir,
+                            &profiles::Profile::new(name.clone(), load_snapshot(snapshot)?)?
+                        )?
+                        .display()
+                    ),
+                    ProfilesCommand::Duplicate { file, name } => println!(
+                        "{}",
+                        profiles::save(
+                            &dir,
+                            &profiles::Profile::new(name.clone(), profiles::load(file)?.snapshot)?
+                        )?
+                        .display()
+                    ),
+                    ProfilesCommand::Draft {
+                        file,
+                        current,
+                        output,
+                        only,
+                    } => {
+                        let selected = if only.is_empty() {
+                            profiles::Selection::default()
+                        } else {
+                            profiles::Selection {
+                                keys: only.iter().any(|v| v == "keys"),
+                                macros: only.iter().any(|v| v == "macros"),
+                                lighting: only.iter().any(|v| v == "lighting"),
+                                performance: only.iter().any(|v| v == "performance"),
+                                options: only.iter().any(|v| v == "options"),
+                                active_layer: only.iter().any(|v| v == "active-layer"),
+                            }
+                        };
+                        transaction::save_new(
+                            output,
+                            &profiles::load(file)?.draft(&load_snapshot(current)?, selected)?,
+                        )?;
+                    }
+                }
+            }
+            Command::Review { current, target } => {
+                ensure!(!args.apply, "Review is offline");
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&review::rows(
+                        &load_snapshot(current)?,
+                        &load_snapshot(target)?
+                    )?)?
+                );
+            }
+            Command::Diagnostics { snapshot } => {
+                ensure!(!args.apply, "Diagnostics do not apply changes");
+                let snapshot = snapshot.as_ref().map(load_snapshot).transpose()?;
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&diagnostics::report(
+                        snapshot.as_ref(),
+                        None,
+                        0,
+                        Vec::new()
+                    ))?
+                );
+            }
+            Command::Pictures { file } => {
+                if !args.apply {
+                    println!(
+                        "{}",
+                        serde_json::json!({"preview_only":true,"pictures":3,"temporarily_changes_lighting":true,"output":file})
+                    );
+                } else {
+                    let api = HidApi::new()?;
+                    let path = args.device.as_deref().map(CString::new).transpose()?;
+                    let keyboard =
+                        Keyboard::open_with_transport(&api, path.as_deref(), args.transport)?;
+                    pictures::capture(
+                        &keyboard,
+                        file,
+                        args.before.as_ref().context("Before-state path required")?,
+                    )?;
+                    println!("Saved all three pictures; original lighting restored");
+                }
+            }
+            Command::Host { command } => {
+                ensure!(
+                    !args.apply,
+                    "Host remapping uses its own explicit --activate flag"
+                );
+                match command {
+                    HostCommand::Devices => println!(
+                        "{}",
+                        serde_json::to_string_pretty(&host::linux::devices()?)?
+                    ),
+                    HostCommand::Focus => println!("{}", host::linux::focused_app(None)?),
+                    HostCommand::Example { file } => {
+                        transaction::save_new(file, &host::Config::example())?
+                    }
+                    HostCommand::Check { file }
+                    | HostCommand::Run {
+                        file,
+                        activate: false,
+                    } => {
+                        let config: host::Config = read_json(file)?;
+                        config.validate()?;
+                        println!(
+                            "Valid host configuration: {} devices, {} rules, {} chords. No input was captured.",
+                            config.devices.len(),
+                            config.rules.len(),
+                            config.chords.len()
+                        );
+                    }
+                    HostCommand::Run {
+                        file,
+                        activate: true,
+                    } => host::linux::run(read_json(file)?)?,
+                }
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    })())
 }
 
 fn rgb(text: &str) -> Result<[u8; 3], String> {
@@ -375,6 +577,16 @@ fn preview(changes: &[Change]) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if matches!(
+        args.command,
+        Command::Profiles { .. }
+            | Command::Review { .. }
+            | Command::Diagnostics { .. }
+            | Command::Pictures { .. }
+            | Command::Host { .. }
+    ) {
+        return local_command(&args).expect("local command");
+    }
     if matches!(args.command, Command::Firmware { .. }) {
         return firmware_command(&args);
     }

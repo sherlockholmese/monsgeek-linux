@@ -71,7 +71,16 @@ action; in particular system power/sleep actions are not triggered unattended.
 
 ## Exclusions and remaining work
 
-Excluded: native audio/screen streaming, host application/website launch services,
+Named profiles, readable change review, focused keyboard testing, complete
+three-picture capture/individual restore, diagnostics export, known firmware
+hash recognition, battery notifications, tray/profile controls, XDG login startup
+and an opt-in evdev/uinput host remapper are implemented. The host engine supports
+tap-hold, tap dance, chords, app-specific remapping and direct launch actions.
+See [FEATURES.md](FEATURES.md) for offline/GUI validation and the remaining real
+input/desktop/hardware checks. This work did not activate host capture, change
+access rules or autostart, capture pictures from hardware, or flash firmware.
+
+Excluded: native audio/screen streaming,
 system-wide macro recording, wireless firmware updates, already-booted
 firmware recovery and destructive reset. Magnetic/keyboard-screen features
 belong to other models and are not original-M1W coverage gaps.
@@ -79,6 +88,6 @@ belong to other models and are not original-M1W coverage gaps.
 Remaining validation: owner-observed actions/LEDs, power-cycle persistence, option
 semantics outside the tested Windows-lock bit, layer/physical OS-switch behavior,
 and failure/disconnect recovery. Final exported state exactly matches
-the pre-test baseline, with no test macros left. No installer or
-udev rule has been installed; nothing is committed or pushed (workspace has no Git
-repository). Usage, JSON formats and restore caveats are in [USAGE.md](USAGE.md).
+the pre-test baseline, with no test macros left. This feature pass did not install
+rules, enable autostart, activate input remapping, commit or push changes. Usage,
+JSON formats and restore caveats are in [USAGE.md](USAGE.md).

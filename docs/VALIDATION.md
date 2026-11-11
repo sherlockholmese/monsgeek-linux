@@ -6,7 +6,30 @@ not a mocked HID transport. They compare complete exported state after each
 change and explicit undo. An export includes the selected RGB picture, not all
 inactive pictures. Physical behavior and unplug/replug persistence are unproved.
 
-## Current implementation results
+## Feature additions (2026-11-11)
+
+The profiles, review, tester, three-picture backup, desktop integration,
+diagnostics and host remapper are covered in [FEATURES.md](FEATURES.md). The
+workspace suite passes 55 tests (10 GUI, 13 library, 5 CLI, 7 codec, 14 feature,
+6 protocol), with three renderer-dependent screenshot tests ignored by default.
+The new feature screenshot test was also run explicitly and passed, producing
+ten inspected light/dark screenshots under `/tmp/monsgeek-features-*.png`.
+Final `cargo fmt --all --check`, `cargo clippy --offline --workspace --all-targets
+-- -D warnings`, and `cargo build --offline --release --workspace -j 4` passed.
+The release CLI also exported offline diagnostics and recognized the retained
+ID983 v108 vendor image by exact hash in preview mode without HID access.
+
+New checks cover selective profile restore and offline CLI workflows, RGB
+picture identity, readable per-key differences, diagnostics omissions, tester
+focus loss, tap-hold interruption/timeouts, tap dance, chord fallback order,
+application changes during a held action, modifier reference counts, literal
+launch arguments, bounded focus queries and 5,000 mixed input events with
+balanced synthetic key releases. These are software tests; they do not establish
+real evdev/uinput, desktop notifications/tray, login-startup or picture-capture
+behaviour on the owner's session/hardware. No such service or capture was
+activated during this pass.
+
+## Original configuration implementation results
 
 Offline:16 Rust tests (3 CLI,7 config,6 protocol), formatter, Clippy with warnings
 denied and release build passed. Tests cover public binding tuples, signed

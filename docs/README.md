@@ -8,8 +8,10 @@ userspace traffic, not a Linux kernel driver. Normal typing already works via HI
 | Document | Contents |
 |---|---|
 | [USAGE.md](USAGE.md) | CLI commands, JSON formats, backup/undo/restore and safe use |
+| [FEATURES.md](FEATURES.md) | Named profiles, change review, tester, complete RGB backups, desktop integration, diagnostics and host remapping |
 | [PROTOCOL.md](PROTOCOL.md) | Transport, opcodes, exact field layouts, binding/macro/RGB codecs, vendor defects |
 | [FIRMWARE.md](FIRMWARE.md) | Experimental USB firmware updater, file format, explicit flashing flags and unvalidated limits |
+| [QMK-VIA-RESEARCH.md](QMK-VIA-RESEARCH.md) | Downloaded ID983 v108 firmware, ARM analysis, USB descriptors, and QMK/VIA feasibility |
 | [STREAMING.md](STREAMING.md) | Model-specific audio/screen UI, native service calls, missing live HID codec |
 | [SOURCES.md](SOURCES.md) | Reproducible source acquisition, hashes, inheritance, research locators |
 | [HANDOFF.md](HANDOFF.md) | Next implementation tasks, ownership boundaries, validation gates and open questions |
@@ -29,8 +31,9 @@ userspace traffic, not a Linux kernel driver. Normal typing already works via HI
 - **Unresolved**: ambiguous host behavior, unsupported-looking echoes, native
   service internals, or device behavior requiring a controlled write/physical test.
 
-This is a detailed host-protocol reconstruction, **not a complete firmware
-disassembly or a fully hardware-validated port**. Explicit remaining research is
+This includes a detailed host-protocol reconstruction and an initial static
+firmware analysis, **not a complete firmware disassembly or a fully
+hardware-validated port**. Explicit remaining research is
 part of the handoff. Do not convert a generic inherited capability into a claim
 that the original M1W supports it.
 

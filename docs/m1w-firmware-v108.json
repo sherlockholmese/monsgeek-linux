@@ -1,0 +1,159 @@
+{
+  "evidence": "offline static analysis of vendor download; no hardware flash or firmware dump",
+  "device_id": 983,
+  "vendor_version": "v108",
+  "metadata_url": "https://api2.rongyuan.tech:3816/api/v2/get_fw_version",
+  "metadata_request": {
+    "dev_id": 983
+  },
+  "download_url": "https://api2.rongyuan.tech:3816/download/fw_upgrade_file/983_v108",
+  "download_bytes": 86253,
+  "download_sha256": "99e93a620c60745bff1e01d69a75055d2e25a3cfcfc87561db7d3c0edfb4b4a6",
+  "image_bytes": 282912,
+  "image_sha256": "7c8f0287d2d4dc916f88e68ad59e56544187faa8c5c008441a068d1922aa26c7",
+  "application_file_offset": "0x10000",
+  "application_bytes": 217376,
+  "application_sha256": "0127131261637cdb354f5cf3b13987f0b08846be541ce545ef10e91fa1a165bd",
+  "application_blocks": 3397,
+  "application_byte_sum": 11162067,
+  "analysis_mapping_base": "0x1000200",
+  "application_write_base_literal": "0x01010200",
+  "application_reset": "0x01010400",
+  "application_main": "0x010104fc",
+  "architecture": "ARM Thumb; YiChip YC3121-compatible peripheral map; exact chip marking unverified",
+  "scatter": {
+    "application": {
+      "source": "0x01033900",
+      "ram": "0x20000",
+      "bytes": 1852,
+      "source_end_file_offset": "0x33b4f",
+      "sha256": "40a331e25566ad96e6fb0c39da76511526bf8dfe4bee7452e36df7480011ada1"
+    },
+    "boot": {
+      "source": "0x0100350c",
+      "ram": "0x20000",
+      "bytes": 304,
+      "source_end_file_offset": "0x33c5",
+      "sha256": "5245419c03c8505bdaed2dc28052ba39a198496ceeb586a9dc748a143171d2b0"
+    },
+    "original_arm_routines_match": true
+  },
+  "application_usb_descriptors": [
+    {
+      "ram_address": "0x2051c",
+      "vid": "0x3151",
+      "pid": "0x4015",
+      "device_bcd": "0x0108",
+      "raw": "12 01 00 02 00 00 00 40 51 31 15 40 08 01 01 02 00 01"
+    }
+  ],
+  "bundled_boot_usb_descriptors": [
+    {
+      "ram_address": "0x2008c",
+      "vid": "0x3151",
+      "pid": "0x4016",
+      "device_bcd": "0x0729",
+      "raw": "12 01 00 02 00 00 00 40 51 31 16 40 29 07 01 02 00 01"
+    }
+  ],
+  "vendor_feature_descriptor": {
+    "ram_address": "0x20660",
+    "usage_page": "0xffff",
+    "usage": 2,
+    "report_bytes": 64,
+    "type": "feature",
+    "report_id": 0
+  },
+  "host_default_matrix_matches": {
+    "defaultMatrix": {
+      "bytes": 512,
+      "sha256": "a07d7aba28e89ad74069e198dfea2192559efb0f65cc4a9ba8e382e13ac3447e",
+      "full_matches_file_offsets": [
+        "0x331ac",
+        "0x3ff00",
+        "0x40100",
+        "0x40300",
+        "0x40500",
+        "0x40700",
+        "0x40900",
+        "0x40b00",
+        "0x40d00"
+      ],
+      "full_matches_mapped_addresses": [
+        "0x10333ac",
+        "0x1040100",
+        "0x1040300",
+        "0x1040500",
+        "0x1040700",
+        "0x1040900",
+        "0x1040b00",
+        "0x1040d00",
+        "0x1040f00"
+      ]
+    },
+    "defaultFnMatrix": {
+      "bytes": 512,
+      "sha256": "551a57b169901b61b8b063cdfccd16246ef7320ed3e51c614a11fd6b355312db",
+      "full_matches_file_offsets": [
+        "0x44880",
+        "0x44a80"
+      ],
+      "full_matches_mapped_addresses": [
+        "0x1044a80",
+        "0x1044c80"
+      ]
+    },
+    "defaultFnMACMatrix": {
+      "bytes": 512,
+      "sha256": "551a57b169901b61b8b063cdfccd16246ef7320ed3e51c614a11fd6b355312db",
+      "full_matches_file_offsets": [
+        "0x44880",
+        "0x44a80"
+      ],
+      "full_matches_mapped_addresses": [
+        "0x1044a80",
+        "0x1044c80"
+      ]
+    }
+  },
+  "limits": [
+    "not a readout of the owner's flash",
+    "not a tested recovery image",
+    "no QMK/VIA replacement implemented",
+    "GPIO matrix pins and recovery unverified"
+  ],
+  "research_date": "2026-11-11",
+  "metadata_response": {
+    "code": 0,
+    "err_message": null,
+    "data": {
+      "id": 364,
+      "dev_id": 983,
+      "company": "akko",
+      "version_str": "v108",
+      "lowest_app_version_str": "2.0.5",
+      "description": "修改拨动开关拨到开机档切换模式成有线模式,电脑关机后键盘无法唤醒",
+      "file_path": "fw_upgrade_file/983_v108",
+      "create_at": {
+        "secs_since_epoch": 1699438223,
+        "nanos_since_epoch": 2771000
+      },
+      "update_at": {
+        "secs_since_epoch": 1699438223,
+        "nanos_since_epoch": 2771000
+      }
+    }
+  },
+  "comparison_sources": {
+    "yc3121_header": {
+      "url": "https://raw.githubusercontent.com/RT-Thread/rt-thread/master/bsp/yichip/yc3121-pos/libraries/core/yc3121.h",
+      "sha256": "c4f1a83a3db05458c70e77bbe8847a460a3ac48d2c31659d4174239e6a9f1d6c"
+    },
+    "m1_v5_keyboard": {
+      "url": "https://raw.githubusercontent.com/MonsGeek/m1_v5/master/us/m1_v5/keyboard.json",
+      "sha256": "a0b9fee294ffd271460f2ce9270619d062e84905900c09a96f373b58f3287d0c",
+      "processor": "WB32FQ95",
+      "bootloader": "wb32-dfu"
+    }
+  }
+}

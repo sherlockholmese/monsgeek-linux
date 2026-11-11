@@ -1,7 +1,9 @@
 //! Native GPUI configurator for the original MonsGeek M1W.
 mod app;
 mod board;
+mod desktop;
 mod device;
+mod features;
 mod log;
 mod pages;
 mod settings;

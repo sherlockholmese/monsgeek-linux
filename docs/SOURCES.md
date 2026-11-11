@@ -110,6 +110,13 @@ and unvalidated boundaries. No native updater binary was executed.
 
 ## Other research
 
+The vendor's firmware API was queried for ID983 on 2026-11-11 and its v108
+package was downloaded and analyzed offline. Acquisition URLs, hashes, startup
+decompression, ARM mapping, USB descriptors and QMK/VIA source comparisons are
+recorded in [QMK-VIA-RESEARCH.md](QMK-VIA-RESEARCH.md). The reproducible analyzer
+is `docs/tools/analyze_firmware.py`; raw binaries remain in the ignored
+`.amp/in/firmware/id983/` directory. No hardware was flashed during this pass.
+
 [Sharkfin](https://github.com/dniminenn/sharkfin) was consulted as a cross-check;
 its original M1W entry marked the protocol family unknown when inspected. The
 temporary clone was removed. The official model dispatch and codecs, not another

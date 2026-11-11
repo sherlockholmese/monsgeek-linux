@@ -11,8 +11,9 @@ and power-cycle persistence are separate checks, not inferred from readback.
 
 Start with [the usage guide](docs/USAGE.md), [feature status](docs/STATUS.md) and
 [validation evidence](docs/VALIDATION.md). Protocol/source references are in
-[docs/README.md](docs/README.md). Audio/screen streaming and other host-native
-services and destructive reset remain excluded. Firmware updates are
+[docs/README.md](docs/README.md). [Profiles, testing, desktop controls and optional
+Linux host remapping](docs/FEATURES.md) extend the configurator. Audio/screen
+streaming, system-wide macro recording and destructive reset remain excluded. Firmware updates are
 [implemented experimentally over USB](docs/FIRMWARE.md), without hardware validation.
 
 ## Implemented
@@ -37,7 +38,7 @@ services and destructive reset remain excluded. Firmware updates are
 - Offline previews, ordered JSON plans, difference-only restore, multi-change
   undo, exclusive0600 before-state files, advisory device lock and readback checks.
 
-Not implemented: host-native audio/screen/launcher services, system-wide macro
+Not implemented: host-native audio/screen streaming, system-wide macro
 recording or destructive reset.
 
 ## Graphical configurator
@@ -47,6 +48,13 @@ the same onboard features: lighting effects and per-key custom pictures, base an
 Fn remapping on all four layers including the knob, combinations, media, mouse,
 layer and macro actions, macro recording and editing, debounce, wireless sleep,
 keyboard options, active layer, export/open and undo.
+
+It also provides named profiles with selective loading, before/after change
+review, a focused keyboard tester, complete three-picture RGB backups, diagnostic
+exports, low-battery notifications, tray controls, optional login startup, and an
+experimental Linux host remapper for tap-hold, tap dance, chords, application
+rules and launch actions. See [the feature guide](docs/FEATURES.md) for setup and
+the distinction between onboard and host behaviour.
 
 ```sh
 cargo run --release -p monsgeek-gui

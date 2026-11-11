@@ -27,6 +27,8 @@ pub const MAX_PAYLOAD_BYTES: usize = u16::MAX as usize * 64;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ImageInfo {
+    /// Exact known vendor download, not cryptographic authentication.
+    pub known_release: Option<KnownRelease>,
     pub experimental: bool,
     pub target_device_id: u32,
     pub image_model_verified: bool,
@@ -36,6 +38,23 @@ pub struct ImageInfo {
     pub blocks: u16,
     pub payload_sum: u32,
     pub sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct KnownRelease {
+    pub device_id: u32,
+    pub version: &'static str,
+    pub source_url: &'static str,
+}
+
+pub fn known_release(sha256: &str) -> Option<KnownRelease> {
+    sha256
+        .eq_ignore_ascii_case("7c8f0287d2d4dc916f88e68ad59e56544187faa8c5c008441a068d1922aa26c7")
+        .then_some(KnownRelease {
+            device_id: 983,
+            version: "v108",
+            source_url: "https://api2.rongyuan.tech:3816/download/fw_upgrade_file/983_v108",
+        })
 }
 
 #[derive(Clone)]
@@ -60,6 +79,7 @@ impl Image {
         );
         Ok(Self {
             info: ImageInfo {
+                known_release: known_release(&format!("{:x}", Sha256::digest(bytes))),
                 experimental: true,
                 target_device_id: protocol::DEVICE_ID,
                 image_model_verified: false,

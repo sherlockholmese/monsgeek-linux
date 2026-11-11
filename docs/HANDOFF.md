@@ -24,6 +24,17 @@ or pushed. The udev rule was syntax-checked, not installed.
 
 ## Ownership and interfaces
 
+The later feature pass adds `src/profiles.rs`, `review.rs`, `pictures.rs`,
+`diagnostics.rs`, `host.rs` and `host/linux.rs`; GUI integration is in
+`gui/src/features.rs` and `desktop.rs`. Read [FEATURES.md](FEATURES.md) before
+changing the host service, profile restore masks, complete RGB capture or desktop
+preferences. The host engine is deterministic and separately tested from its
+evdev/uinput transport; no real input capture was activated during development.
+The GUI's host child exits with its parent and preserves explicit Start/Stop.
+Profiles and picture restoration stage changes for the existing transaction
+path. The named-profile CLI is plural `profiles`; the older singular `profile`
+command still selects an onboard layer.
+
 - `src/protocol.rs`: checksum/framing, identity, Lighting, serialized Change,
   scalar and multipart packet dispatch, ordinary usage-to-slot mapping.
 - `src/config.rs`: typed/raw binding tuples, full source-slot lookup, semantic

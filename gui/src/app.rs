@@ -50,16 +50,26 @@ pub enum Page {
     System,
     Backups,
     Logs,
+    Profiles,
+    Tester,
+    Review,
+    Desktop,
+    Host,
 }
 
 impl Page {
-    pub const ALL: [Page; 7] = [
+    pub const ALL: [Page; 12] = [
         Page::Lighting,
         Page::Keys,
         Page::Macros,
         Page::Performance,
         Page::System,
         Page::Backups,
+        Page::Profiles,
+        Page::Review,
+        Page::Tester,
+        Page::Host,
+        Page::Desktop,
         Page::Logs,
     ];
 
@@ -72,6 +82,11 @@ impl Page {
             Page::System => "System",
             Page::Backups => "Backups",
             Page::Logs => "Logs",
+            Page::Profiles => "Profiles",
+            Page::Tester => "Keyboard tester",
+            Page::Review => "Changes",
+            Page::Desktop => "Desktop",
+            Page::Host => "Host remapping",
         }
     }
 
@@ -85,6 +100,11 @@ impl Page {
             Page::System => L::SlidersHorizontal,
             Page::Backups => L::Archive,
             Page::Logs => L::ScrollText,
+            Page::Profiles => L::Layers,
+            Page::Tester => L::Keyboard,
+            Page::Review => L::ArrowLeftRight,
+            Page::Desktop => L::Monitor,
+            Page::Host => L::Command,
         })
     }
 }
@@ -100,6 +120,7 @@ pub enum Busy {
     Reading,
     Applying,
     Flashing,
+    Capturing,
 }
 
 /// Decoded lighting controls. `rgb` survives picture mode, which stores a
@@ -141,6 +162,7 @@ pub struct Recording {
 }
 
 pub struct Workbench {
+    pub features: crate::features::Features,
     pub page: Page,
     pub link: Link,
     pub busy: Option<Busy>,
@@ -247,6 +269,7 @@ impl Workbench {
         }
         this.reload(window, cx);
         this.watch_presence(window, cx);
+        this.start_desktop(window, cx);
         let forced = cfg!(debug_assertions) && std::env::var_os("M1W_OFFER_ACCESS").is_some();
         if forced || access::should_offer() {
             // The dialog layer exists only once the window has rendered.
@@ -450,6 +473,7 @@ impl Workbench {
             }
         };
         let before = self.presence;
+        self.check_battery(now, cx);
         if before == Some(now) {
             return;
         }
@@ -573,6 +597,11 @@ impl Workbench {
                 Ok("system") => Page::System,
                 Ok("backups") => Page::Backups,
                 Ok("logs") => Page::Logs,
+                Ok("profiles") => Page::Profiles,
+                Ok("tester") => Page::Tester,
+                Ok("review") => Page::Review,
+                Ok("desktop") => Page::Desktop,
+                Ok("host") => Page::Host,
                 _ => Page::Lighting,
             }
         } else {
@@ -592,6 +621,7 @@ impl Workbench {
             );
         }
         Self {
+            features: crate::features::Features::new(window, cx),
             page,
             link: Link::Reading,
             busy: None,
@@ -635,7 +665,12 @@ impl Workbench {
     }
 
     /// Adopt a fresh device read as both baseline and draft.
-    fn loaded(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn loaded(
+        &mut self,
+        snapshot: Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.link = Link::Ready;
         self.baseline = Some(snapshot.clone());
         self.draft = Some(snapshot);
@@ -738,6 +773,13 @@ impl Workbench {
     }
 
     pub fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.features.host_process.is_some() {
+            window.push_notification(
+                Notification::error("Stop host remapping before applying keyboard changes"),
+                cx,
+            );
+            return;
+        }
         let (Some(baseline), Some(draft)) = (self.baseline.clone(), self.draft.clone()) else {
             return;
         };
@@ -965,6 +1007,7 @@ impl Workbench {
 
     pub fn can_flash_firmware(&self) -> bool {
         self.busy.is_none()
+            && self.features.host_process.is_none()
             && self.transport == Some(Kind::Usb)
             && self.baseline.is_some()
             && self.firmware_image.is_some()
@@ -1156,7 +1199,7 @@ impl Workbench {
     }
 
     pub fn editable(&self) -> bool {
-        !matches!(self.busy, Some(Busy::Applying | Busy::Flashing)) && self.draft.is_some()
+        self.busy.is_none() && self.draft.is_some()
     }
 
     pub fn edit(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Snapshot)) {
@@ -1491,7 +1534,9 @@ impl Workbench {
             } else {
                 ThemeChoice::Light
             }),
+            ..self.features.preferences.clone()
         };
+        self.features.preferences = saved.clone();
         if let Err(e) = settings::save(&saved) {
             self.log(Entry::error("Cannot save theme", &e));
         }
@@ -1629,6 +1674,8 @@ impl Render for Workbench {
                         .icon(page.icon())
                         .active(self.page == page)
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            this.features.testing = false;
+                            this.features.held.clear();
                             this.page = page;
                             cx.notify();
                         }))
@@ -1720,19 +1767,22 @@ impl Render for Workbench {
                         .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
                 )
             })
-            .when(self.draft.is_some(), |this| {
+            .when(self.draft.is_some() && self.page != Page::Review, |this| {
                 this.child(
                     Button::new("apply")
                         .primary()
                         .small()
                         .label(match count {
-                            0 => "Apply".to_string(),
-                            1 => "Apply 1 change".into(),
-                            n => format!("Apply {n} changes"),
+                            0 => "Review changes".to_string(),
+                            1 => "Review 1 change".into(),
+                            n => format!("Review {n} changes"),
                         })
                         .loading(applying)
                         .disabled(count == 0 || self.busy.is_some())
-                        .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.page = Page::Review;
+                            cx.notify();
+                        })),
                 )
             });
 
@@ -1775,6 +1825,7 @@ mod tests {
     use super::*;
     use gpui_kit::TestAppContext;
     use monsgeek_linux::config::SleepTimers;
+    use std::time::Duration;
 
     fn fixture() -> Snapshot {
         let map = |fn_layer| -> Vec<u8> {
@@ -2057,5 +2108,129 @@ mod tests {
             w.store_macro(cx);
             assert_eq!(w.pending().unwrap().len(), 1);
         });
+    }
+
+    #[gpui::test]
+    fn named_profile_load_stages_changes_and_keeps_the_baseline(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        view.update_in(cx, |w, window, cx| {
+            let before = w.baseline.clone().unwrap();
+            let mut target = before.clone();
+            target.keymaps[0][12..16].copy_from_slice(&[0, 0, 224, 0]);
+            w.load_profile(
+                monsgeek_linux::profiles::Profile::new("Coding".into(), target).unwrap(),
+                window,
+                cx,
+            );
+            assert_eq!(w.page, Page::Review);
+            assert_eq!(w.baseline, Some(before));
+            assert_eq!(w.pending().unwrap().len(), 1);
+            assert!(w.busy.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn tester_focus_loss_clears_held_keys_and_never_edits_the_draft(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        cx.update(|window, _| window.activate_window());
+        cx.run_until_parked();
+        view.update_in(cx, |w, _, cx| {
+            w.page = Page::Tester;
+            cx.notify();
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        view.update_in(cx, |w, window, cx| {
+            w.features.testing = true;
+            window.focus(&w.features.tester_focus, cx);
+            w.features.test_event(Some(4), "A".into(), true);
+            assert!(w.features.held.contains(&4));
+            assert!(w.pending().unwrap().is_empty());
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        view.update_in(cx, |w, window, cx| {
+            assert!(w.features.tester_focus.is_focused(window));
+            window.blur(cx);
+        });
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.run_until_parked();
+        view.read_with(cx, |w, _| {
+            assert!(!w.features.testing);
+            assert!(w.features.held.is_empty());
+        });
+    }
+
+    #[test]
+    #[ignore = "requires a headless GPU renderer; writes screenshots to /tmp"]
+    fn feature_screenshots() {
+        use gpui_kit::size;
+        use std::{cell::RefCell, rc::Rc};
+        let platform = gpui_kit::platform::current_platform(true);
+        let mut context = gpui::HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(crate::AppAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        context.update(gpui_kit::init);
+        context.update(crate::use_geist);
+        for (label, page, width, mode) in [
+            ("profiles-dark", Page::Profiles, 1240., ThemeMode::Dark),
+            ("profiles-light", Page::Profiles, 960., ThemeMode::Light),
+            ("review-dark", Page::Review, 960., ThemeMode::Dark),
+            ("review-light", Page::Review, 1240., ThemeMode::Light),
+            ("tester-dark", Page::Tester, 960., ThemeMode::Dark),
+            ("desktop-light", Page::Desktop, 960., ThemeMode::Light),
+            ("host-dark", Page::Host, 1240., ThemeMode::Dark),
+            ("host-error", Page::Host, 960., ThemeMode::Light),
+            ("pictures-light", Page::Backups, 960., ThemeMode::Light),
+            ("profile-dialog", Page::Profiles, 960., ThemeMode::Dark),
+        ] {
+            let state = Rc::new(RefCell::new(None));
+            let handle=context.open_window(size(px(width),px(820.)),|window,cx| {
+                Theme::change(mode,Some(window),cx);
+                let view=cx.new(|cx| {
+                    let mut w=Workbench::build(window,cx);w.loaded(fixture(),window,cx);w.page=page;
+                    w.features.profiles=vec!["Coding", "Gaming", "Default", "Long configuration name with a narrow window and all restore options visible"].into_iter().enumerate().map(|(i,name)| (PathBuf::from(format!("/tmp/profile-{i}.json")),monsgeek_linux::profiles::Profile::new(name.into(),fixture()).unwrap())).collect();
+                    if page==Page::Review {w.set_binding(3,[0,0,224,0],cx);w.paint(4,cx);w.edit_light(cx,|l|l.brightness=1);}
+                    if page==Page::Tester {w.features.testing=true;w.features.test_event(Some(4),"A".into(),true);w.features.test_event(Some(224),"Ctrl".into(),true);}
+                    if label=="host-error" {w.features.host_error=Some("Cannot read the selected input device. Configure input access and try again.".into());}
+                    w
+                });
+                *state.borrow_mut()=Some(view.clone());cx.new(|cx|gpui_kit::base::Root::new(view,window,cx))
+            }).unwrap();
+            context.run_until_parked();
+            context.advance_clock(Duration::from_millis(500));
+            context.run_until_parked();
+            context
+                .update_window(handle.into(), |_, window, cx| {
+                    if label == "profile-dialog" {
+                        state.borrow().as_ref().unwrap().update(cx, |w, cx| {
+                            w.name_profile(fixture(), "Coding".into(), window, cx)
+                        });
+                    }
+                    let _ = window.draw(cx);
+                })
+                .unwrap();
+            context.run_until_parked();
+            context.advance_clock(Duration::from_millis(500));
+            context.run_until_parked();
+            context
+                .update_window(handle.into(), |_, window, cx| {
+                    let _ = window.draw(cx);
+                })
+                .unwrap();
+            context
+                .capture_screenshot(handle.into())
+                .unwrap()
+                .save(format!("/tmp/monsgeek-features-{label}.png"))
+                .unwrap();
+        }
     }
 }
