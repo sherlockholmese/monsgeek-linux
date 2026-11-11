@@ -90,7 +90,8 @@ monsgeek-linux pictures all-pictures.json \
   low-battery cycle; charging above the threshold plus five points rearms it.
   Wireless must expose a battery level. Notifications use the desktop's D-Bus
   service.
-- An optional StatusNotifier tray icon. Its menu opens the window, loads a
+- An optional StatusNotifier tray icon, disabled by default. Enable **Show tray
+  icon** in **Desktop**. Its menu opens the window, loads a
   profile **for review**, stops host remapping, or quits. Desktops without a
   StatusNotifier host can keep using the window.
 - **Open at login**, which creates/removes this app's user XDG autostart entry.

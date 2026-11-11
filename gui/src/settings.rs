@@ -25,7 +25,7 @@ impl Default for Settings {
             theme: None,
             battery_alerts: true,
             battery_threshold: 15,
-            tray: true,
+            tray: false,
         }
     }
 }
