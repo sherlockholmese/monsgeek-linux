@@ -9,6 +9,9 @@ use gpui_kit::{ElementId, InteractiveElement};
 /// Content column width shared by the title row and every page.
 const COLUMN: f32 = 1120.;
 
+/// Immediate contact, followed by a short native easing on release.
+pub const PRESS_RELEASE: std::time::Duration = std::time::Duration::from_millis(90);
+
 /// The surface ladder: window canvas (behind the sidebar), the inset content
 /// panel, and cards on the panel. Dark mode steps lighter toward the reader;
 /// light mode keeps the panel and cards white on a tinted canvas.

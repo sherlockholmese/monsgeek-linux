@@ -1,8 +1,8 @@
 [Desktop Entry]
 Type=Application
-Name=MonsGeek M1W
+Name=MonsGeek
 GenericName=Keyboard Configurator
-Comment=Configure lighting, keys and macros of the original MonsGeek M1W
+Comment=Configure MonsGeek keyboard lighting, keys and macros
 Exec=monsgeek-gui
 Icon=monsgeek-linux
 Terminal=false

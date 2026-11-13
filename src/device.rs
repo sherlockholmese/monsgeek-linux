@@ -58,6 +58,7 @@ pub fn snapshot_phase(done: usize) -> Phase {
 pub struct Keyboard {
     channel: Channel,
     _lock: File,
+    model: &'static crate::models::Model,
 }
 
 /// Lock the configuration node itself (no stale lockfile or /tmp path),
@@ -85,6 +86,8 @@ pub fn lock_node(info: &DeviceInfo, wait: Duration) -> Result<File> {
 pub fn wireless_status(api: &HidApi) -> Result<Option<(Kind, Option<u8>)>> {
     let receiver = crate::dongle::status(api)?;
     if let Some(crate::dongle::Link::Online { battery }) = receiver {
+        let keyboard = Keyboard::open_with_transport(api, None, Some(Kind::Dongle))?;
+        let _ = keyboard.model();
         return Ok(Some((Kind::Dongle, Some(battery))));
     }
     if let Some(info) = api
@@ -114,6 +117,8 @@ pub struct Onboard {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advanced: Option<crate::advanced::Settings>,
     pub format_version: u8,
     pub device_id: u32,
     pub usb_revision: u16,
@@ -127,15 +132,23 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    pub fn model(&self) -> Result<&'static crate::models::Model> {
+        crate::models::get(self.device_id)
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            matches!(self.format_version, 1 | 2) && self.device_id == protocol::DEVICE_ID,
-            "not a supported original M1W snapshot"
+            matches!(self.format_version, 1..=3),
+            "unsupported snapshot format"
         );
-        protocol::layer(self.active_layer)?;
-        for maps in [&self.keymaps, &self.fn_keymaps] {
+        let model = self.model()?;
+        model.layer(self.active_layer)?;
+        for (maps, count) in [
+            (&self.keymaps, model.base_maps()),
+            (&self.fn_keymaps, model.fn_maps()),
+        ] {
             ensure!(
-                maps.len() == 4 && maps.iter().all(|m| m.len() == 512),
+                maps.len() == usize::from(count) && maps.iter().all(|m| m.len() == 512),
                 "invalid keymap dimensions"
             );
         }
@@ -148,21 +161,73 @@ impl Snapshot {
             );
         }
         ensure!(
-            self.format_version != 2 || self.onboard.is_some(),
+            self.format_version == 1 || self.onboard.is_some(),
             "incomplete version2 snapshot"
+        );
+        if let Some(settings) = &self.advanced {
+            for (parameter, data) in &settings.magnetic {
+                ensure!(
+                    data.len() == crate::advanced::magnetic_bytes(model, *parameter)?,
+                    "invalid magnetic parameter dimensions"
+                );
+            }
+            if self.format_version == 3 {
+                if model.family == crate::models::Family::Ry5088 {
+                    ensure!(
+                        settings.options.is_some() && settings.report_rate.is_some(),
+                        "modern snapshot lacks options or report rate"
+                    );
+                }
+                ensure!(
+                    !model.side_light || settings.side_lighting.is_some(),
+                    "snapshot lacks side lighting"
+                );
+                if model.magnetic {
+                    ensure!(
+                        matches!(settings.units_per_mm, 10 | 100 | 200 | 1000),
+                        "invalid magnetic precision"
+                    );
+                    for parameter in [0, 1, 2, 3, 4, 5, 6, 7, 9, 10] {
+                        ensure!(
+                            settings.magnetic.contains_key(&parameter),
+                            "snapshot lacks magnetic parameter {parameter}"
+                        );
+                    }
+                    ensure!(
+                        !model.replaceable_switches || settings.magnetic.contains_key(&252),
+                        "snapshot lacks switch types"
+                    );
+                    ensure!(
+                        model.family != crate::models::Family::Yc500
+                            || settings.magnetic_mode.is_some(),
+                        "snapshot lacks actuation preset"
+                    );
+                }
+            }
+        }
+        ensure!(
+            self.format_version < 3 || self.advanced.is_some(),
+            "incomplete version3 snapshot"
         );
         Ok(())
     }
 
     pub fn inverse(&self, change: &Change) -> Result<Change> {
         self.validate()?;
-        change.packets()?;
+        change.packets_for(self.model()?)?;
         let onboard = || {
             self.onboard
                 .as_ref()
                 .context("legacy snapshot lacks this setting")
         };
         Ok(match change {
+            Change::Advanced { change } => Change::Advanced {
+                change: change.inverse(
+                    self.advanced
+                        .as_ref()
+                        .context("advanced settings not captured")?,
+                )?,
+            },
             Change::Profile { .. } => Change::Profile {
                 layer: self.active_layer,
             },
@@ -216,10 +281,30 @@ impl Snapshot {
         self.validate()?;
         target.validate()?;
         ensure!(
+            self.device_id == target.device_id,
+            "snapshot keyboard model mismatch"
+        );
+        ensure!(
             self.usb_revision == target.usb_revision,
             "snapshot firmware revision mismatch"
         );
         let mut changes = Vec::new();
+        if let Some(wanted) = &target.advanced {
+            let current = self
+                .advanced
+                .as_ref()
+                .context("current snapshot lacks advanced settings")?;
+            ensure!(
+                !self.model()?.magnetic || current.units_per_mm == wanted.units_per_mm,
+                "magnetic precision differs; capture a new snapshot before restoring"
+            );
+            changes.extend(
+                current
+                    .differences(wanted)
+                    .into_iter()
+                    .map(|change| Change::Advanced { change }),
+            );
+        }
         if let Some(t) = &target.onboard {
             let c = self
                 .onboard
@@ -257,7 +342,7 @@ impl Snapshot {
             (false, &self.keymaps, &target.keymaps),
             (true, &self.fn_keymaps, &target.fn_keymaps),
         ] {
-            for layer in 0..4 {
+            for layer in 0..maps.len() {
                 for slot in 0..128 {
                     let start = slot * 4;
                     if maps[layer][start..start + 4] != wanted[layer][start..start + 4] {
@@ -282,7 +367,7 @@ impl Snapshot {
             });
         }
         for c in &changes {
-            c.packets()?;
+            c.packets_for(self.model()?)?;
         }
         Ok(changes)
     }
@@ -323,7 +408,7 @@ impl Keyboard {
             .find(|k| all.iter().any(|(_, kind)| kind == k))
         else {
             bail!(
-                "no original M1W found over USB cable, 2.4 GHz receiver or Bluetooth; connect it and run `list`"
+                "no supported keyboard found over USB cable, 2.4 GHz receiver or Bluetooth; connect it and run `list`"
             );
         };
         if preferred == Kind::Dongle
@@ -343,12 +428,21 @@ impl Keyboard {
         on_selected(kind);
         let info = matches[0].0;
         let lock = lock_node(info, Duration::from_secs(1))?;
-        let keyboard = Self {
+        let mut keyboard = Self {
+            model: crate::models::original(),
             channel: Channel::open(api, info, kind)?,
             _lock: lock,
         };
-        protocol::identify(&keyboard.query(0x8f, &[])?)?;
+        keyboard.model = crate::models::get(protocol::identify(&keyboard.query(0x8f, &[])?)?)?;
         Ok(keyboard)
+    }
+
+    pub fn model(&self) -> &'static crate::models::Model {
+        self.model
+    }
+
+    fn modern(&self) -> bool {
+        self.model.family == crate::models::Family::Ry5088
     }
 
     pub fn kind(&self) -> Kind {
@@ -395,7 +489,12 @@ impl Keyboard {
     }
 
     pub fn active_layer(&self) -> Result<u8> {
-        protocol::layer(self.query(0x85, &[])?[1])
+        let value = self.query(if self.modern() { 0x84 } else { 0x85 }, &[])?[1];
+        self.model.layer(if self.model.magnetic && !self.modern() {
+            value / 4
+        } else {
+            value
+        })
     }
 
     pub fn lighting(&self) -> Result<Lighting> {
@@ -403,14 +502,32 @@ impl Keyboard {
     }
 
     pub fn debounce(&self) -> Result<u8> {
-        Ok(self.query(0x91, &[])?[2])
+        ensure!(self.model.debounce, "debounce unavailable on this model");
+        Ok(if self.modern() {
+            self.query(0x86, &[])?[1]
+        } else {
+            self.query(0x91, &[])?[2]
+        })
     }
 
     pub fn sleep_timers(&self) -> Result<SleepTimers> {
-        SleepTimers::decode(&self.query(0x92, &[])?)
+        ensure!(self.model.sleep, "wireless sleep unavailable on this model");
+        if self.modern() {
+            let r = self.query(0x91, &[])?;
+            let value = |i| u16::from_le_bytes([r[i], r[i + 1]]);
+            Ok(SleepTimers {
+                time_bt: value(8),
+                time_24: value(10),
+                deep_time_bt: value(12),
+                deep_time_24: value(14),
+            })
+        } else {
+            SleepTimers::decode(&self.query(0x92, &[])?)
+        }
     }
 
     pub fn options(&self) -> Result<[u8; 3]> {
+        ensure!(!self.modern(), "this model uses modern-options");
         Ok(self.query(0x86, &[0])?[2..5].try_into()?)
     }
 
@@ -418,6 +535,78 @@ impl Keyboard {
         let r = self.query(0x97, &[])?;
         ensure!(r[1] <= 1, "invalid auto-OS response");
         Ok(r[1] == 1)
+    }
+
+    pub fn advanced_settings(&self, revision: u16) -> Result<crate::advanced::Settings> {
+        use crate::advanced::Settings;
+        let mut settings = Settings {
+            units_per_mm: 10,
+            ..Default::default()
+        };
+        if self.modern() {
+            let rf = self.query(0x80, &[])?;
+            let rf = u16::from_le_bytes([rf[1], rf[2]]);
+            settings.rf_revision = (rf != 0).then_some(rf);
+            settings.units_per_mm =
+                crate::advanced::legacy_precision(revision, settings.rf_revision);
+            if self.model.magnetic {
+                let features = self.exchange(&packet(&[0xe6], 7))?;
+                if features[0] == 0xe6 && features[1] == 0xaa {
+                    settings.units_per_mm = match features[2] {
+                        0 => 100,
+                        1 => 200,
+                        2 => 1000,
+                        _ => anyhow::bail!("unknown magnetic precision"),
+                    };
+                    if features[3] == 1 {
+                        let output = self.query(0x9d, &[])?;
+                        ensure!(
+                            output[1] <= 1,
+                            "unknown output mode; select keyboard mode in the vendor driver first"
+                        );
+                        settings.output_mode = Some(output[1]);
+                    }
+                }
+            }
+            settings.options = Some(self.query(0x89, &[])?[2..6].try_into()?);
+            let code = self.query(0x83, &[])?[2];
+            settings.report_rate = Some(
+                *[8000, 4000, 2000, 1000, 500, 250, 125]
+                    .get(usize::from(code))
+                    .context("invalid report-rate reply")?,
+            );
+        }
+        if self.model.side_light {
+            let mut response = self.query(0x88, &[])?;
+            response[0] = 0x87;
+            settings.side_lighting = Some(Lighting::decode(&response)?);
+        }
+        if self.model.magnetic {
+            for parameter in [0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 252, 251] {
+                if parameter == 252 && !self.model.replaceable_switches {
+                    continue;
+                }
+                if parameter == 251
+                    && (!self.modern() || revision.max(settings.rf_revision.unwrap_or(0)) < 0x0400)
+                {
+                    continue;
+                }
+                let size = crate::advanced::magnetic_bytes(self.model, parameter)?;
+                let mut data = Vec::with_capacity(size);
+                for page in 0..size / 64 {
+                    data.extend_from_slice(
+                        &self.exchange(&packet(&[0xe5, parameter, 1, page as u8], 7))?,
+                    );
+                }
+                settings.magnetic.insert(parameter, data);
+            }
+            if !self.modern() {
+                let mode = self.query(0x9d, &[])?[1];
+                ensure!(mode <= 3, "invalid magnetic preset reply");
+                settings.magnetic_mode = Some(mode);
+            }
+        }
+        Ok(settings)
     }
 
     fn raw_pages(&self, opcode: u8, selector: u8, pages: u8) -> Result<Vec<u8>> {
@@ -440,17 +629,145 @@ impl Keyboard {
     }
 
     pub fn rgb(&self) -> Result<Vec<u8>> {
-        self.raw_pages(0x8c, 0, 6)
+        if self.modern() {
+            let picture = crate::transaction::picture(&self.lighting()?);
+            (0..6)
+                .map(|page| {
+                    self.exchange(&packet(&[0x8c, picture, 255, page], 7))
+                        .map(|p| p.to_vec())
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|p| p.concat())
+        } else {
+            self.raw_pages(0x8c, 0, 6)
+        }
     }
 
     pub fn keymap(&self, layer: u8, fn_layer: bool) -> Result<Vec<u8>> {
-        protocol::layer(layer)?;
-        self.raw_pages(if fn_layer { 0x90 } else { 0x89 }, layer, 8)
+        ensure!(
+            layer
+                < if fn_layer {
+                    self.model.fn_maps()
+                } else {
+                    self.model.base_maps()
+                },
+            "map out of range"
+        );
+        if self.modern() {
+            (0..8)
+                .map(|page| {
+                    let header = if fn_layer {
+                        let (system, index) = self.model.fn_address(layer)?;
+                        vec![0x90, system, index, 255, page]
+                    } else {
+                        vec![
+                            0x8a,
+                            if self.model.magnetic {
+                                layer / 4
+                            } else {
+                                layer
+                            },
+                            255,
+                            page,
+                            if self.model.magnetic { layer % 4 } else { 0 },
+                        ]
+                    };
+                    self.exchange(&packet(&header, 7)).map(|p| p.to_vec())
+                })
+                .collect::<Result<Vec<_>>>()
+                .map(|p| p.concat())
+        } else {
+            self.raw_pages(if fn_layer { 0x90 } else { 0x89 }, layer, 8)
+        }
     }
 
     pub fn firmware_revision(&self) -> Result<u16> {
-        let reply = self.query(0x80, &[])?;
-        Ok(u16::from_le_bytes([reply[1], reply[2]]))
+        let reply = self.query(if self.modern() { 0x8f } else { 0x80 }, &[])?;
+        Ok(if self.modern() {
+            u16::from_le_bytes([reply[7], reply[8]])
+        } else {
+            u16::from_le_bytes([reply[1], reply[2]])
+        })
+    }
+
+    /// Explicit calibration session; callers journal a fresh snapshot first.
+    pub fn calibrate(&self, start: bool) -> Result<()> {
+        ensure!(self.model.magnetic, "calibration unavailable on this model");
+        ensure!(
+            self.kind() == Kind::Usb,
+            "use the USB cable for calibration"
+        );
+        ensure!(
+            protocol::identify(&self.query(0x8f, &[])?)? == self.model.id,
+            "keyboard identity changed"
+        );
+        if start {
+            self.send(&packet(&[28, 1], 7))?;
+            sleep(Duration::from_secs(4));
+            self.send(&packet(&[28, 0], 7))?;
+            sleep(Duration::from_secs(2));
+            self.send(&packet(&[30, 1], 7))?;
+        } else {
+            self.send(&packet(&[30, 0], 7))?;
+        }
+        sleep(Duration::from_secs(2));
+        Ok(())
+    }
+
+    /// Live travel on modern boards; normalized calibration range on YC500.
+    pub fn travel(&self) -> Result<Vec<f32>> {
+        ensure!(
+            self.model.magnetic,
+            "travel reporting unavailable on this model"
+        );
+        if self.modern() {
+            let revision = self.firmware_revision()?;
+            let rf = self.query(0x80, &[])?;
+            let mut precision = f32::from(crate::advanced::legacy_precision(
+                revision,
+                Some(u16::from_le_bytes([rf[1], rf[2]])),
+            ));
+            let features = self.exchange(&packet(&[0xe6], 7))?;
+            if features[0] == 0xe6 && features[1] == 0xaa {
+                precision = match features[2] {
+                    0 => 100.,
+                    1 => 200.,
+                    2 => 1000.,
+                    _ => anyhow::bail!("unknown travel precision"),
+                };
+            }
+            let mut bytes = Vec::new();
+            for page in 0..4 {
+                bytes.extend_from_slice(&self.exchange(&packet(&[0xe5, 254, 1, page], 7))?);
+            }
+            Ok(bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|v| f32::from(u16::from_le_bytes([v[0], v[1]])) / precision)
+                .collect())
+        } else {
+            let mut ranges = Vec::new();
+            for opcode in [0x9e, 0x9c] {
+                let mut values = Vec::new();
+                for page in 0..4 {
+                    values.extend_from_slice(&self.exchange(&packet(&[opcode, page], 7))?);
+                }
+                ranges.push(
+                    values
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|v| u16::from_le_bytes([v[0], v[1]]))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            Ok(ranges[0]
+                .iter()
+                .zip(&ranges[1])
+                .map(|(max, min)| (f32::from(max.abs_diff(*min)) / 400.).min(1.))
+                .collect())
+        }
     }
 
     pub(crate) fn enter_firmware_boot(&self) -> Result<()> {
@@ -462,30 +779,94 @@ impl Keyboard {
     }
 
     pub fn snapshot(&self) -> Result<Snapshot> {
-        let revision = self.query(0x80, &[])?;
+        self.snapshot_reporting(|_, _| {})
+    }
+
+    pub fn snapshot_reporting(&self, mut progress: impl FnMut(&str, usize)) -> Result<Snapshot> {
+        let modern = self.modern();
+        let base_queries = 1
+            + usize::from(self.model.base_maps() + self.model.fn_maps()) * 8
+            + 3
+            + 6
+            + usize::from(modern)
+            + 200
+            + usize::from(self.model.debounce)
+            + usize::from(self.model.sleep)
+            + usize::from(!modern);
+        progress("Firmware", base_queries);
+        let revision = self.firmware_revision()?;
+        progress("Model settings", base_queries);
+        let advanced = self.advanced_settings(revision)?;
+        let total = base_queries
+            + if modern {
+                3 + usize::from(self.model.magnetic)
+            } else {
+                0
+            }
+            + usize::from(advanced.output_mode.is_some())
+            + usize::from(advanced.side_lighting.is_some())
+            + advanced
+                .magnetic
+                .values()
+                .map(|data| data.len() / 64)
+                .sum::<usize>()
+            + usize::from(advanced.magnetic_mode.is_some());
         let mut keymaps = Vec::new();
         let mut fn_keymaps = Vec::new();
-        for layer in 0..4 {
-            keymaps.push(self.keymap(layer, false)?);
-            fn_keymaps.push(self.keymap(layer, true)?);
+        for layer in 0..self.model.base_maps().max(self.model.fn_maps()) {
+            if layer < self.model.base_maps() {
+                progress(&format!("Base map {}", layer + 1), total);
+                keymaps.push(self.keymap(layer, false)?);
+            }
+            if layer < self.model.fn_maps() {
+                progress(&format!("Fn map {}", layer + 1), total);
+                fn_keymaps.push(self.keymap(layer, true)?);
+            }
         }
+        progress("Keyboard settings", total);
+        let active_layer = self.active_layer()?;
+        let lighting = self.lighting()?;
+        let debounce = if self.model.debounce {
+            self.debounce()?
+        } else {
+            0
+        };
+        let sleep = if self.model.sleep {
+            self.sleep_timers()?
+        } else {
+            SleepTimers {
+                time_bt: 0,
+                time_24: 0,
+                deep_time_bt: 0,
+                deep_time_24: 0,
+            }
+        };
+        let options = if modern { [0; 3] } else { self.options()? };
+        let auto_os = self.auto_os()?;
+        progress("Custom picture", total);
+        let rgb = self.rgb()?;
+        let mut macros = Vec::new();
+        for slot in 0..50 {
+            progress(&format!("Macro {} of 50", slot + 1), total);
+            macros.push(self.macro_data(slot)?);
+        }
+        progress("Finishing", total);
         Ok(Snapshot {
-            format_version: 2,
-            device_id: protocol::DEVICE_ID,
-            usb_revision: u16::from_le_bytes([revision[1], revision[2]]),
-            active_layer: self.active_layer()?,
-            lighting: self.lighting()?,
+            advanced: Some(advanced),
+            format_version: 3,
+            device_id: self.model.id,
+            usb_revision: revision,
+            active_layer,
+            lighting,
             keymaps,
             fn_keymaps,
             onboard: Some(Onboard {
-                debounce: self.debounce()?,
-                sleep: self.sleep_timers()?,
-                options: self.options()?,
-                auto_os: self.auto_os()?,
-                rgb: self.rgb()?,
-                macros: (0..50)
-                    .map(|slot| self.macro_data(slot))
-                    .collect::<Result<_>>()?,
+                debounce,
+                sleep,
+                options,
+                auto_os,
+                rgb,
+                macros,
             }),
         })
     }
@@ -494,6 +875,15 @@ impl Keyboard {
     /// lighting, which writes may temporarily alter) on top of `base`.
     /// Over 2.4 GHz a full snapshot takes about 30 seconds; this takes seconds.
     pub fn refresh(&self, base: &Snapshot, changes: &[Change]) -> Result<Snapshot> {
+        // Advanced arrays are captured together so interdependent modes,
+        // travel thresholds and DKS bodies have a consistent stale-state check.
+        if changes.iter().any(|c| matches!(c, Change::Advanced { .. })) {
+            ensure!(
+                base.device_id == self.model.id,
+                "baseline keyboard model mismatch"
+            );
+            return self.snapshot();
+        }
         #[derive(PartialEq, Eq, PartialOrd, Ord)]
         enum Region {
             Debounce,
@@ -507,6 +897,7 @@ impl Keyboard {
         let mut regions = BTreeSet::new();
         for change in changes {
             match change {
+                Change::Advanced { .. } => unreachable!("handled by full refresh"),
                 Change::Profile { .. } | Change::Lighting { .. } => {}
                 Change::Debounce { .. } => _ = regions.insert(Region::Debounce),
                 Change::Sleep { .. } => _ = regions.insert(Region::Sleep),
@@ -523,9 +914,13 @@ impl Keyboard {
                 } => _ = regions.insert(Region::Keymap(*layer, *fn_layer)),
             }
         }
+        base.validate()?;
+        ensure!(
+            base.device_id == self.model.id,
+            "baseline keyboard model mismatch"
+        );
         let mut s = base.clone();
-        let revision = self.query(0x80, &[])?;
-        s.usb_revision = u16::from_le_bytes([revision[1], revision[2]]);
+        s.usb_revision = self.firmware_revision()?;
         s.active_layer = self.active_layer()?;
         s.lighting = self.lighting()?;
         for region in regions {
@@ -558,13 +953,26 @@ impl Keyboard {
 
     /// Caller must save the before-state before invoking an experimental write.
     pub fn apply(&self, change: &Change) -> Result<()> {
-        let packets = change.packets()?;
+        let mut packets = change.packets_for(self.model)?;
         // Recheck identity immediately before each write, even after a snapshot.
-        protocol::identify(&self.query(0x8f, &[])?)?;
+        ensure!(
+            protocol::identify(&self.query(0x8f, &[])?)? == self.model.id,
+            "keyboard identity changed"
+        );
+        if self.modern() && matches!(change, Change::Rgb { .. }) {
+            let picture = crate::transaction::picture(&self.lighting()?);
+            for p in &mut packets {
+                p[1] = picture;
+                p[7] = 0;
+                *p = packet(p, 7);
+            }
+        }
         // Revision0108 ignores the single-binding packet's layer selector and
         // writes the active map. Select the requested layer and restore it only
         // after a verified write; on failure retain the saved state for inspection.
-        let original_layer = if let Change::Remap { layer, .. } = change {
+        let original_layer = if let Change::Remap { layer, .. } = change
+            && self.model.id == 983
+        {
             let original = self.active_layer()?;
             if original != *layer {
                 self.apply(&Change::Profile { layer: *layer })?;
@@ -578,7 +986,7 @@ impl Keyboard {
         // Macro49 affects picture0 even when another picture is selected. GET
         // follows selection, so explicitly select0 before capturing its bytes.
         // Restore the previous effect only after macro and picture verification.
-        let original_lighting = if matches!(change, Change::Macro { .. }) {
+        let original_lighting = if matches!(change, Change::Macro { .. }) && self.model.id == 983 {
             let original = self.lighting()?;
             let picture0 = Lighting {
                 mode: 13,
@@ -597,7 +1005,7 @@ impl Keyboard {
             None
         };
         // Preserve the entire picture, not just a known slot or guessed default.
-        let macro_rgb = if matches!(change, Change::Macro { .. }) {
+        let macro_rgb = if matches!(change, Change::Macro { .. }) && self.model.id == 983 {
             Some(self.rgb()?)
         } else {
             None
@@ -623,6 +1031,9 @@ impl Keyboard {
             );
         }
         let matched = match change {
+            Change::Advanced { change } => {
+                change.inverse(&self.advanced_settings(self.firmware_revision()?)?)? == *change
+            }
             Change::Profile { layer } => self.active_layer()? == *layer,
             Change::Lighting { settings } => self.lighting()? == *settings,
             Change::Debounce { value } => self.debounce()? == *value,

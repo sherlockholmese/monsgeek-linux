@@ -8,6 +8,7 @@ use monsgeek_linux::{
 
 fn snapshot() -> Snapshot {
     Snapshot {
+        advanced: None,
         format_version: 2,
         device_id: 983,
         usb_revision: 0x108,

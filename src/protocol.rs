@@ -33,6 +33,68 @@ pub struct Lighting {
 }
 
 impl Lighting {
+    pub fn new_for(
+        model: &crate::models::Model,
+        mode: u8,
+        speed: u8,
+        brightness: u8,
+        option: u8,
+        rainbow: bool,
+        rgb: [u8; 3],
+    ) -> Result<Self> {
+        ensure!(
+            model.supports_effect(mode),
+            "effect {mode} is unavailable on {}",
+            model.name
+        );
+        ensure!(
+            !matches!(mode, 20..=22),
+            "host streaming effects require a streaming service"
+        );
+        ensure!(
+            speed <= 4 && brightness <= 4,
+            "speed and brightness must be 0..4"
+        );
+        if let Some(effect) = model.effect(mode) {
+            ensure!(
+                brightness <= effect.brightness,
+                "brightness exceeds model limit"
+            );
+            if !effect.options.is_empty() {
+                ensure!(
+                    effect
+                        .options
+                        .get(usize::from(option))
+                        .is_some_and(Option::is_some),
+                    "direction or picture unavailable on this model"
+                );
+            } else {
+                ensure!(option == 0, "effect has no direction option");
+            }
+        } else {
+            ensure!(option == 0, "effect has no direction option");
+        }
+        Ok(Self {
+            mode,
+            wire_speed: model.wire_max_speed() - speed,
+            brightness,
+            flags: (option << 4)
+                | if mode == 13 {
+                    0
+                } else if rainbow {
+                    model.dazzle
+                } else {
+                    model.normal
+                },
+            rgb: if mode == 13 {
+                [0, 200, 200]
+            } else if rgb == [255; 3] {
+                [250, 255, 250]
+            } else {
+                rgb
+            },
+        })
+    }
     pub fn decode(reply: &Packet) -> Result<Self> {
         ensure!(reply[0] == 0x87, "unexpected lighting response opcode");
         Ok(Self {
@@ -112,6 +174,9 @@ impl Lighting {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Change {
+    Advanced {
+        change: crate::advanced::Change,
+    },
     Profile {
         layer: u8,
     },
@@ -146,8 +211,161 @@ pub enum Change {
 }
 
 impl Change {
+    /// Encode against the identified model. The legacy methods retain the M1W API.
+    pub fn packets_for(&self, model: &crate::models::Model) -> Result<Vec<Packet>> {
+        use crate::models::Family;
+        let modern = model.family == Family::Ry5088;
+        match self {
+            Self::Advanced { change } => change.packets(model),
+            Self::Profile { layer } => {
+                model.layer(*layer)?;
+                Ok(vec![packet(
+                    &[
+                        if modern { 4 } else { 5 },
+                        if model.magnetic && !modern {
+                            *layer * 4
+                        } else {
+                            *layer
+                        },
+                    ],
+                    7,
+                )])
+            }
+            Self::Remap {
+                layer,
+                fn_layer,
+                slot,
+                binding,
+            } => {
+                ensure!(*slot < 128, "matrix slot must be 0..127");
+                ensure!(
+                    model.is_remappable(*slot),
+                    "this input is fixed by the {} firmware",
+                    model.name
+                );
+                ensure!(
+                    *layer
+                        < if *fn_layer {
+                            model.fn_maps()
+                        } else {
+                            model.base_maps()
+                        },
+                    "map out of range for {}",
+                    model.name
+                );
+                let mut header = [0; 12];
+                if modern && *fn_layer {
+                    let (system, index) = model.fn_address(*layer)?;
+                    header[..4].copy_from_slice(&[0x10, system, index, *slot]);
+                } else if modern {
+                    header[..3].copy_from_slice(&[
+                        0x0a,
+                        if model.magnetic { *layer / 4 } else { *layer },
+                        *slot,
+                    ]);
+                    header[5] = 1;
+                    header[6] = if model.magnetic { *layer % 4 } else { 0 };
+                } else {
+                    header[..3].copy_from_slice(&[
+                        if *fn_layer { 0x15 } else { 0x13 },
+                        *layer,
+                        *slot,
+                    ]);
+                }
+                header[8..].copy_from_slice(binding);
+                Ok(vec![packet(&header, 7)])
+            }
+            Self::Debounce { value } => {
+                ensure!(model.debounce, "debounce is unavailable on {}", model.name);
+                ensure!((1..=10).contains(value), "debounce must be 1..10");
+                Ok(vec![if modern {
+                    packet(&[6, *value], 7)
+                } else {
+                    packet(&[0x11, 0, *value], 7)
+                }])
+            }
+            Self::Sleep { timers } => {
+                ensure!(
+                    model.sleep,
+                    "wireless sleep is unavailable on {}",
+                    model.name
+                );
+                for (value, bounds) in [
+                    timers.time_bt,
+                    timers.time_24,
+                    timers.deep_time_bt,
+                    timers.deep_time_24,
+                ]
+                .iter()
+                .zip(&model.sleep_ranges)
+                {
+                    if let Some([min, max]) = bounds {
+                        ensure!(
+                            (*min..=*max).contains(value),
+                            "timer must be {min}..{max} seconds on {}",
+                            model.name
+                        );
+                    }
+                }
+                if modern {
+                    let mut header = [0; 16];
+                    header[0] = 0x11;
+                    for (i, value) in [
+                        timers.time_bt,
+                        timers.time_24,
+                        timers.deep_time_bt,
+                        timers.deep_time_24,
+                    ]
+                    .iter()
+                    .enumerate()
+                    {
+                        ensure!(*value <= 64800, "sleep timer must not exceed 18 hours");
+                        header[8 + i * 2..10 + i * 2].copy_from_slice(&value.to_le_bytes());
+                    }
+                    Ok(vec![packet(&header, 7)])
+                } else {
+                    self.packets()
+                }
+            }
+            Self::Options { .. } => {
+                ensure!(!modern, "this model uses modern-options");
+                self.packets()
+            }
+            Self::Macro { slot, data } if modern => {
+                let mut packets = crate::config::macro_packets(*slot, data)?;
+                for p in &mut packets {
+                    p[0] = 0x0b;
+                    p[7] = 0;
+                    *p = packet(p, 7);
+                }
+                Ok(packets)
+            }
+            Self::Rgb { data } if modern => {
+                ensure!(data.len() == 384, "RGB image must contain 384 bytes");
+                Ok(data
+                    .chunks(56)
+                    .enumerate()
+                    .map(|(page, bytes)| {
+                        let mut header = [0; 64];
+                        header[..6].copy_from_slice(&[
+                            12,
+                            0,
+                            255,
+                            page as u8,
+                            bytes.len() as u8,
+                            u8::from(page == 6),
+                        ]);
+                        header[8..8 + bytes.len()].copy_from_slice(bytes);
+                        packet(&header, 7)
+                    })
+                    .collect())
+            }
+            _ => self.packets(),
+        }
+    }
     pub fn packets(&self) -> Result<Vec<Packet>> {
         match self {
+            Self::Advanced { change } => change.packets(crate::models::original()),
             Self::Macro { slot, data } => crate::config::macro_packets(*slot, data),
             Self::Rgb { data } => crate::config::rgb_packets(data),
             _ => Ok(vec![self.packet()?]),
@@ -156,6 +374,7 @@ impl Change {
 
     pub fn packet(&self) -> Result<Packet> {
         match self {
+            Self::Advanced { .. } => anyhow::bail!("advanced change: use packets_for()"),
             Self::Profile { layer: value } => Ok(packet(&[5, layer(*value)?], 7)),
             Self::Lighting { settings } => Ok(settings.packet()),
             Self::Debounce { value } => {
@@ -216,9 +435,6 @@ pub fn decode_feature(bytes: &[u8]) -> Result<Packet> {
 pub fn identify(reply: &Packet) -> Result<u32> {
     ensure!(reply[0] == 0x8f, "unexpected identity response opcode");
     let id = u32::from_le_bytes(reply[1..5].try_into()?);
-    ensure!(
-        id == DEVICE_ID,
-        "device identified as {id}, not original M1W ({DEVICE_ID}); refusing further commands"
-    );
+    crate::models::get(id)?;
     Ok(id)
 }

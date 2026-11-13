@@ -1,12 +1,14 @@
-# Original M1W reverse-engineering handoff
+# MonsGeek configuration documentation
 
-Start with [USAGE.md](USAGE.md) and [STATUS.md](STATUS.md). The owner resumed
+Start with the [52-model coverage table](KEYBOARDS.md), [USAGE.md](USAGE.md) and [STATUS.md](STATUS.md). The owner resumed
 implementation and connected-device validation after the reverse-engineering pass.
 Rust is a suitable implementation language: the configuration protocol is USB HID
 userspace traffic, not a Linux kernel driver. Normal typing already works via HID.
 
 | Document | Contents |
 |---|---|
+| [KEYBOARDS.md](KEYBOARDS.md) | Exact 52-model scope, capabilities, selection, preview/animation behavior and source caveats |
+| [models.json](models.json) | Generated model facts, geometry, matrices and source hashes |
 | [USAGE.md](USAGE.md) | CLI commands, JSON formats, backup/undo/restore and safe use |
 | [FEATURES.md](FEATURES.md) | Named profiles, change review, tester, complete RGB backups, desktop integration, diagnostics and host remapping |
 | [PROTOCOL.md](PROTOCOL.md) | Transport, opcodes, exact field layouts, binding/macro/RGB codecs, vendor defects |

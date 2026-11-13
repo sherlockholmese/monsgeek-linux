@@ -1,51 +1,50 @@
-# Original M1W implementation status
+# MonsGeek implementation status
 
-The Rust CLI implements the reconstructed non-native configuration features of
-the original mechanical M1W over USB, the receiver and experimental Bluetooth. The owner resumed implementation
-after the research-only phase. This is a userspace configurator, not a kernel
-driver, firmware replacement or port of the graphical application.
+The Rust CLI and native GPUI app cover all 52 MonsGeek entries in the bundled
+v500.3.3 catalog. The [exact model table](KEYBOARDS.md) defines the boundary.
+This is a userspace configurator, not a kernel driver or firmware replacement.
 
-## Device and evidence boundary
+## Evidence boundary
 
-Validated device: USB `3151:4015`, interface2, usage `ffff:0002`, internal ID983,
-revision `0x0108`; observed node `/dev/hidraw7` is not a permanent name.
-Readback and exact configuration restoration are tested separately from physical
-behavior. Key/knob output, actual LED appearance, wireless timer expiry, physical
-Win/Mac-switch relationships and unplug/replug persistence still need observation.
-See [VALIDATION.md](VALIDATION.md) for executed cases and failures, not just claims.
+Original M1W ID983/revision0x0108 has earlier real USB/receiver readback and
+reversible configuration tests. All other models are implemented from vendor
+host evidence and tested offline. This pass did not configure, calibrate or
+flash physical keyboards. No claim of 52 hardware-validated devices is made.
+Physical key/knob behavior, LED fidelity, timer expiry, OS-switch semantics,
+retention and disconnect recovery still need per-model validation.
 
 ## Feature coverage
 
-| Feature | Implementation / evidence |
+| Feature | Current implementation |
 |---|---|
-| Discovery, identity, firmware revision | Strict identity/interface gate; real device observed |
-| Four base and four Fn maps | Complete512-byte reads; single-slot writes preserve all128 slots |
-| Remapping and Fn/knob positions | Typed keyboard, combos, media/consumer, system, mouse, pointer, disabled, macro and raw/vendor bindings |
-| Onboard lighting | Modes0..19; bounded speed/brightness/options; custom picture labels0..2 |
-| RGB | Read/write384 bytes; single-slot edit from a stale-checked snapshot |
-| Macros | All50 raw slots, semantic JSON, keyboard/buttons/signed movement, repeat/delay bounds, clear and playback bindings |
-| Debounce and sleep | Vendor-range checks; four independently encoded timers |
-| Keyboard options | Raw-preserving named bit edits; raw tuple import retains unknown bits |
-| Auto OS detection | Distinct enabled response observed and original false value restored |
-| Exports / restore / undo | Format2 onboard export, format1 compatibility, difference-only restore, multi-change undo, pre-write backup |
-| GUI | `gui/` GPUI app over the same transaction code; headless view/edit tests; apply not yet exercised on hardware |
-| 2.4 GHz receiver | Full reads verified on `3151:4011` (identical snapshots); Apply of lighting, debounce and an inactive-layer remap, then undo, verified with a byte-identical final read; battery and wake state |
-| Bluetooth | Experimental macOS-reference transport, CLI selection, battery, GUI warning and offline framing checks; no hardware validation |
-| Firmware updates | Experimental USB updater from the macOS reference; local vendor binary, exact-file hash, pre-boot configuration backup, same-port boot discovery, completion check and reconnect; offline tests only |
-| Safety | Offline preview; three explicit apply flags; exclusive0600 files; advisory device-node lock; settling/readback; stop on failure |
+| Discovery/identity |52-model ID allowlist, exact USB/receiver catalog, Bluetooth vendors, numbered HID feature reports |
+| Keyboard preview | Per-model geometry, numpads, ISO/JIS, true knob positions, fixed inputs, keyboard navigation/contact feedback |
+| Maps | Model-specific profiles/Fn maps and four outputs per magnetic profile; all128 tuples preserved |
+| Binding/macros | Typed/raw keyboard, media, system, pointer, disabled, vendor functions and all50 macro slots |
+| Lighting | Advertised effects/directions/palettes, model speed inversion, per-key RGB,3/5 pictures and separate side effects |
+| Animation | Main/side simulations, time/speed/direction/color response, play/pause, suspended inactive frames and reduced motion |
+| Magnetic | Actuation/release, rapid trigger, dead zones, timing, modes, Snap pairs, switch types and four-channel DKS |
+| Sensor operations | Explicit USB calibration and live travel; calibration cannot be undone by snapshot |
+| Performance/options | Model-specific report-rate ceiling, debounce, available timers, legacy/modern options and feature-gated output mode |
+| Snapshots/profiles | Format3, model/revision/precision guards, selective profiles, readable per-key review, undo and saved before-state |
+| Firmware | Experimental model-specific prefixes/boot headers, selected physical port and target identity checks |
+| Desktop/host | Focused tester, diagnostics, tray, notifications, optional startup and evdev/uinput remapper retained |
 
-Settings round trips have covered layer selection, base/Fn edits, combos, knob
-media, mouse, disabled bindings, debounce, sleep, RGB, macros, Windows lock and
-auto-OS, extended/full/gapped macros, all20 onboard modes, inactive base/Fn layers
-and multi-setting restore. Storing a binding does not prove its physical
-action; in particular system power/sleep actions are not triggered unattended.
+The GUI can inspect every model offline. Preview defaults are synthetic and
+cannot be applied, exported as hardware backups, calibrated or flashed. The CLI
+and GUI accept an explicit device path for multiple attached interfaces. Unknown
+IDs remain refused. Catalog extraction is reproducible without executing vendor JS.
 
-## Important limits and implementation choices
+## Original-M1W limits and implementation choices
+
+The following observations concern ID983/revision0108 only. The macro/RGB and
+inactive-layer workarounds are scoped to that model; they are not imposed on
+every keyboard.
 
 - **Pictures:** GET_USERPIC returns the selected picture, despite a zero selector.
   Selecting picture2 changed the read image; selecting0 returned the untouched
   original. Queries with selector1/2 did not expose different images. A read-only
-  export captures one selected384-byte picture, **not all three inactive images**.
+  export captures one selected384-byte picture, **not all three pictures**.
   Independent edits to pictures1/2 survived switching away/back and were undone;
   picture0 remained untouched in those tests.
   Select and export each picture separately. Transactions combining an RGB write
@@ -69,25 +68,19 @@ action; in particular system power/sleep actions are not triggered unattended.
   with no automatic retry or general rollback. RGB preservation is an explicit
   part of successful macro apply, not a recovery guarantee after transport failure.
 
-## Exclusions and remaining work
+## Exclusions and remaining validation
 
-Named profiles, readable change review, focused keyboard testing, complete
-three-picture capture/individual restore, diagnostics export, known firmware
-hash recognition, battery notifications, tray/profile controls, XDG login startup
-and an opt-in evdev/uinput host remapper are implemented. The host engine supports
-tap-hold, tap dance, chords, app-specific remapping and direct launch actions.
-See [FEATURES.md](FEATURES.md) for offline/GUI validation and the remaining real
-input/desktop/hardware checks. This work did not activate host capture, change
-access rules or autostart, capture pictures from hardware, or flash firmware.
+Native audio/screen streaming, keyboard-screen hardware, global macro recording,
+destructive reset, wireless flashing and already-booted recovery remain excluded.
+The unresolved streaming codec is documented in [STREAMING.md](STREAMING.md).
+Catalog coverage does not imply compatibility with unrelated VIA/QMK models.
 
-Excluded: native audio/screen streaming,
-system-wide macro recording, wireless firmware updates, already-booted
-firmware recovery and destructive reset. Magnetic/keyboard-screen features
-belong to other models and are not original-M1W coverage gaps.
+M7W ID1215 has a vendor Insert-geometry/Home-slot discrepancy described in
+[KEYBOARDS.md](KEYBOARDS.md). The alias is source-derived and needs physical
+confirmation. New model/protocol support, sensor operations, firmware flashing
+and Bluetooth behavior require hardware validation. Existing historical ID983
+round-trip records remain in [VALIDATION.md](VALIDATION.md).
 
-Remaining validation: owner-observed actions/LEDs, power-cycle persistence, option
-semantics outside the tested Windows-lock bit, layer/physical OS-switch behavior,
-and failure/disconnect recovery. Final exported state exactly matches
-the pre-test baseline, with no test macros left. This feature pass did not install
-rules, enable autostart, activate input remapping, commit or push changes. Usage,
-JSON formats and restore caveats are in [USAGE.md](USAGE.md).
+No access rules were installed, host capture enabled, startup preferences changed,
+firmware flashed, hardware calibrated, commits created or changes pushed during
+this implementation pass.

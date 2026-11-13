@@ -68,10 +68,30 @@ pub fn check_picture(changes: &[Change], current: &Snapshot) -> Result<()> {
 
 /// Check that a saved undo record can be applied to the current device.
 pub fn check_undo(record: &BeforeState, current: &Snapshot) -> Result<()> {
+    record.snapshot.validate()?;
+    current.validate()?;
+    ensure!(
+        current.device_id == record.snapshot.device_id,
+        "undo keyboard model mismatch"
+    );
     ensure!(
         current.usb_revision == record.snapshot.usb_revision,
         "undo firmware revision mismatch"
     );
+    if record.changes().iter().any(|c| {
+        matches!(
+            c,
+            Change::Advanced {
+                change: crate::advanced::Change::Magnetic { .. }
+            }
+        )
+    }) {
+        ensure!(
+            current.advanced.as_ref().map(|s| s.units_per_mm)
+                == record.snapshot.advanced.as_ref().map(|s| s.units_per_mm),
+            "undo magnetic precision mismatch"
+        );
+    }
     ensure!(
         !record
             .changes()
@@ -91,6 +111,11 @@ pub fn commit(
     changes: &[Change],
     before: &Path,
 ) -> Result<BeforeState> {
+    snapshot.validate()?;
+    ensure!(
+        snapshot.device_id == keyboard.model().id,
+        "transaction keyboard model mismatch"
+    );
     check_picture(changes, &snapshot)?;
     let undo_changes = changes
         .iter()
@@ -99,7 +124,7 @@ pub fn commit(
         .collect::<Result<Vec<_>>>()?;
     // Refuse a write if its saved inverse could not be sent by this implementation.
     for undo in &undo_changes {
-        undo.packets()?;
+        undo.packets_for(snapshot.model()?)?;
     }
     let record = BeforeState {
         snapshot,
@@ -140,5 +165,10 @@ pub fn apply_draft(
         "The keyboard changed since it was read. Reload, then edit again."
     );
     commit(keyboard, current.clone(), &changes, before)?;
-    keyboard.refresh(&current, &changes)
+    let after = keyboard.refresh(&current, &changes)?;
+    ensure!(
+        after.restore_changes(draft)?.is_empty(),
+        "final read-back differs from the draft; retain the before-state and inspect the keyboard"
+    );
+    Ok(after)
 }

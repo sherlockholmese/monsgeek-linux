@@ -7,6 +7,7 @@ use gpui_kit::component::{
     color_picker::ColorPicker,
     empty::{Empty, EmptyContent, EmptyHeader, EmptyMedia, EmptyMediaVariant, EmptyTitle},
     h_flex,
+    input::NumberInput,
     progress::Progress,
     scroll::ScrollableElement,
     select::Select,
@@ -22,12 +23,12 @@ use gpui_kit::{
 };
 use monsgeek_linux::{
     config::{Macro, MacroEvent},
-    keys::{self, KNOB_LEFT, KNOB_PRESS, KNOB_RIGHT, MODIFIERS},
+    keys::{self, MODIFIERS},
 };
 
 use crate::{
     app::{Link, Page, Workbench, hsla},
-    board::{Look, OnPick, board},
+    board::{Look, OnPick, board, board_lit},
     effects, ui,
 };
 
@@ -42,6 +43,9 @@ pub fn render(
     if this.page == Page::Logs {
         return logs(this, cx);
     }
+    if this.page == Page::Models {
+        return models_page(this, cx);
+    }
     if this.draft.is_none() {
         return match &this.link {
             Link::Failed(message) => disconnected(message.clone(), this, cx),
@@ -50,6 +54,8 @@ pub fn render(
     }
     match this.page {
         Page::Lighting => lighting(this, window, cx),
+        Page::Models => unreachable!(),
+        Page::Magnetic => magnetic(this, cx),
         Page::Keys => keys_page(this, window, cx),
         Page::Macros => macros(this, window, cx),
         Page::Performance => performance(this, cx),
@@ -60,16 +66,375 @@ pub fn render(
     }
 }
 
+fn models_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
+    let model = monsgeek_linux::models::get(this.preview_model).expect("selected model");
+    let can_open = this.busy.is_none()
+        && !this.features.calibrating
+        && this.pending().is_ok_and(|p| p.is_empty());
+    ui::page(
+        "models",
+        vec![
+            ui::section(
+                "",
+                vec![
+                    ui::icon_row(
+                        gpui_kit::assets::IconName::Keyboard,
+                        "Model",
+                        div().w(px(300.)).child(
+                            Select::new(&this.model_select)
+                                .placeholder("Choose a keyboard")
+                                .search_placeholder("Search models")
+                                .menu_max_h(px(360.)),
+                        ),
+                    ),
+                    h_flex()
+                        .py_3()
+                        .gap_3()
+                        .child(
+                            Button::new("preview-model")
+                                .primary()
+                                .label("Open preview")
+                                .disabled(!can_open)
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    if let Ok(model) =
+                                        monsgeek_linux::models::get(this.preview_model)
+                                    {
+                                        this.loaded(model.example_snapshot(), window, cx);
+                                        this.previewing = true;
+                                        this.transport = None;
+                                        this.page = Page::Lighting;
+                                        cx.notify();
+                                    }
+                                })),
+                        )
+                        .child(
+                            div().text_sm().child(
+                                "Preview layouts and lighting without connecting a keyboard.",
+                            ),
+                        )
+                        .into_any_element(),
+                ],
+                cx,
+            ),
+            board(
+                "model-board",
+                model,
+                |slot| Look {
+                    legend: model.slot_legend(slot).into(),
+                    ..Default::default()
+                },
+                None,
+                cx,
+            ),
+        ],
+    )
+    .into_any_element()
+}
+
+fn magnetic(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
+    let model = this.model();
+    let Some(settings) = this
+        .draft
+        .as_ref()
+        .and_then(|d| d.advanced.clone())
+        .filter(|s| !s.magnetic.is_empty())
+    else {
+        return ui::page(
+            "no-actuation",
+            vec![ui::placeholder(
+                "Actuation settings are unavailable",
+                120.,
+                cx,
+            )],
+        )
+        .into_any_element();
+    };
+    let entity = cx.entity();
+    let keyboard = board(
+        "actuation-board",
+        model,
+        |slot| Look {
+            legend: model.slot_legend(slot).into(),
+            action: if !model
+                .layout()
+                .iter()
+                .any(|c| c.slot == slot && c.usage != 0)
+            {
+                None
+            } else if this.features.live_travel {
+                this.features.travel.get(usize::from(slot)).map(|v| {
+                    if model.family == monsgeek_linux::models::Family::Yc500 {
+                        format!("{:.0}%", v * 100.).into()
+                    } else {
+                        format!("{v:.2}").into()
+                    }
+                })
+            } else {
+                settings
+                    .value(model, 0, slot)
+                    .map(|v| format!("{v:.2}").into())
+            },
+            selected: this.selected == Some(slot),
+            ..Default::default()
+        },
+        Some(Rc::new(move |slot, window, cx| {
+            entity.update(cx, |this, cx| this.select_key(Some(slot), window, cx));
+        })),
+        cx,
+    );
+    let can_finish = !this.previewing
+        && this.busy.is_none()
+        && this.transport == Some(monsgeek_linux::transport::Kind::Usb);
+    let can_calibrate = can_finish && this.pending().is_ok_and(|p| p.is_empty());
+    let calibration = ui::section(
+        "Sensor calibration",
+        vec![
+            h_flex()
+                .py_3()
+                .gap_3()
+                .child(
+                    Button::new("live-travel")
+                        .outline()
+                        .small()
+                        .label(if this.features.live_travel {
+                            "Stop live view"
+                        } else {
+                            "Live travel"
+                        })
+                        .disabled(this.previewing || this.busy.is_some())
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.toggle_travel(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("calibrate-begin")
+                        .outline()
+                        .small()
+                        .label("Calibrate switches")
+                        .disabled(!can_calibrate || this.features.calibrating)
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.confirm_calibration(window, cx)),
+                        ),
+                )
+                .child(
+                    Button::new("calibrate-finish")
+                        .outline()
+                        .small()
+                        .label("Finish calibration")
+                        .disabled(!can_finish)
+                        .loading(this.busy == Some(crate::app::Busy::Calibrating))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.run_calibration(false, window, cx)
+                        })),
+                )
+                .into_any_element(),
+            div()
+                .when(!this.features.calibration_status.is_empty(), |d| {
+                    d.py_2()
+                        .text_sm()
+                        .child(this.features.calibration_status.clone())
+                })
+                .into_any_element(),
+        ],
+        cx,
+    );
+    let Some(slot) = this.selected.filter(|s| {
+        model
+            .layout()
+            .iter()
+            .any(|cap| cap.slot == *s && cap.usage != 0)
+    }) else {
+        return ui::page(
+            "actuation",
+            vec![
+                keyboard,
+                calibration,
+                ui::placeholder("Select a key to edit its actuation", 96., cx),
+            ],
+        )
+        .into_any_element();
+    };
+    let raw_mode = settings
+        .magnetic
+        .get(&7)
+        .map_or(0, |m| m[usize::from(slot)]);
+    let mode = raw_mode & 127;
+    let rapid = raw_mode & 128 != 0;
+    let mut rows = vec![
+        ui::icon_row(
+            gpui_kit::assets::IconName::Gauge,
+            "Key behavior",
+            segmented(
+                "magnetic-mode",
+                ["Normal", "Dynamic", "Tap-hold", "Hold toggle", "Tap toggle"],
+                [0, 2, 3, 4, 5].iter().position(|v| *v == mode).unwrap_or(0),
+                false,
+                move |this, index, window, cx| {
+                    this.edit(cx, |d| {
+                        if let Some(s) = &mut d.advanced {
+                            let _ = s.set_mode(slot, [0, 2, 3, 4, 5][index], rapid);
+                        }
+                    });
+                    this.sync_magnetic(window, cx);
+                },
+                cx,
+            ),
+        ),
+        ui::icon_row(
+            gpui_kit::assets::IconName::Zap,
+            "Rapid trigger",
+            Switch::new("rapid-trigger")
+                .checked(rapid)
+                .on_click(cx.listener(move |this, on: &bool, _, cx| {
+                    this.edit(cx, |d| {
+                        if let Some(s) = &mut d.advanced
+                            && let Some(m) = s.magnetic.get_mut(&7)
+                        {
+                            m[usize::from(slot)] =
+                                (m[usize::from(slot)] & 127) | if *on { 128 } else { 0 };
+                        }
+                    });
+                })),
+        ),
+    ];
+    for (parameter, label) in [
+        (0, "Actuation"),
+        (1, "Release"),
+        (2, "Rapid press"),
+        (3, "Rapid release"),
+        (6, "Bottom dead zone"),
+        (251, "Top dead zone"),
+        (4, "Dynamic threshold"),
+        (5, "Tap-hold time"),
+    ] {
+        if matches!(parameter, 2 | 3) && !rapid
+            || parameter == 4 && mode != 2
+            || parameter == 5 && mode != 3
+        {
+            continue;
+        }
+        let Some(_) = settings.value(model, parameter, slot) else {
+            continue;
+        };
+        rows.push(ui::icon_row(
+            gpui_kit::assets::IconName::ArrowLeftRight,
+            label,
+            div().w(px(208.)).child(
+                NumberInput::new(&this.magnetic_inputs[&parameter])
+                    .small()
+                    .accessibility_label(label)
+                    .suffix(
+                        div()
+                            .text_sm()
+                            .child(if parameter == 5 { "ms" } else { "mm" }),
+                    ),
+            ),
+        ));
+        if let Some(error) = this.magnetic_errors.get(&parameter) {
+            rows.push(ui::error(error.clone(), cx));
+        }
+    }
+    if mode == 2
+        && let Some(data) = settings.magnetic.get(&10)
+    {
+        for output in 0..4usize {
+            let value = data[output * 128 + usize::from(slot)];
+            rows.push(ui::icon_row(
+                gpui_kit::assets::IconName::Keyboard,
+                format!("Output {}", output + 1),
+                Button::new(SharedString::from(format!("dynamic-binding-{output}")))
+                    .outline()
+                    .small()
+                    .label("Edit binding")
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.layer = (this.layer / 4) * 4 + output as u8;
+                        this.fn_layer = false;
+                        this.page = Page::Keys;
+                        this.select_key(Some(slot), window, cx);
+                    })),
+            ));
+            for stage in 0..4usize {
+                rows.push(ui::icon_row(
+                    gpui_kit::assets::IconName::ArrowRight,
+                    [
+                        "Press: first threshold",
+                        "Press: bottom",
+                        "Release: first threshold",
+                        "Release: top",
+                    ][stage],
+                    segmented(
+                        SharedString::from(format!("dynamic-stage-{output}-{stage}")),
+                        ["Off", "Tap", "End hold", "Start hold"],
+                        usize::from((value >> (stage * 2)) & 3),
+                        false,
+                        move |this, state, _, cx| {
+                            this.edit(cx, |d| {
+                                if let Some(s) = &mut d.advanced
+                                    && let Some(data) = s.magnetic.get_mut(&10)
+                                {
+                                    let i = output * 128 + usize::from(slot);
+                                    data[i] = (data[i] & !(3 << (stage * 2)))
+                                        | ((state as u8) << (stage * 2));
+                                }
+                            });
+                        },
+                        cx,
+                    ),
+                ));
+            }
+        }
+    }
+    if !model.switches.is_empty() {
+        rows.push(ui::icon_row(
+            gpui_kit::assets::IconName::Keyboard,
+            "Switch type",
+            div().w(px(240.)).child(
+                Select::new(&this.switch_select)
+                    .placeholder("Choose a switch")
+                    .menu_max_h(px(320.)),
+            ),
+        ));
+    }
+    rows.push(ui::icon_row(
+        gpui_kit::assets::IconName::ArrowLeftRight,
+        "Snap pair",
+        div().w(px(240.)).child(
+            Select::new(&this.snap_select)
+                .placeholder("Choose a partner")
+                .search_placeholder("Search keys")
+                .menu_max_h(px(320.)),
+        ),
+    ));
+    ui::page(
+        "actuation",
+        vec![
+            keyboard,
+            ui::section(model.slot_name(slot), rows, cx),
+            calibration,
+        ],
+    )
+    .into_any_element()
+}
+
 fn loading(this: &Workbench, cx: &App) -> AnyElement {
     use monsgeek_linux::device::{EXCHANGE_BYTES, Phase, SNAPSHOT_EXCHANGES, snapshot_phase};
+    let total = this
+        .progress
+        .total
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let total = if total == 0 {
+        SNAPSHOT_EXCHANGES
+    } else {
+        total
+    };
     let theme = cx.theme();
     let kind = this.progress.kind();
     let done = this
         .progress
         .done
         .load(std::sync::atomic::Ordering::Relaxed)
-        .min(SNAPSHOT_EXCHANGES);
-    let fraction = done as f32 / SNAPSHOT_EXCHANGES as f32;
+        .min(total);
+    let fraction = done as f32 / total as f32;
     let phase = match (kind, snapshot_phase(done)) {
         (None, _) => "Opening".to_string(),
         (_, Phase::Firmware) => "Firmware".into(),
@@ -83,11 +448,23 @@ fn loading(this: &Workbench, cx: &App) -> AnyElement {
         (_, Phase::Macro(slot)) => format!("Macro {} of 50", slot + 1),
         (_, Phase::Done) => "Finishing".into(),
     };
+    let phase = {
+        let actual = this
+            .progress
+            .phase
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if actual.is_empty() {
+            phase
+        } else {
+            actual.clone()
+        }
+    };
     let kb = |n: usize| format!("{:.1}", (n * EXCHANGE_BYTES) as f32 / 1024.);
     let elapsed = this.read_started.map(|t| t.elapsed().as_secs_f32());
     let left = match elapsed {
-        Some(e) if (8..SNAPSHOT_EXCHANGES).contains(&done) => {
-            let s = (e / done as f32 * (SNAPSHOT_EXCHANGES - done) as f32).ceil() as u32;
+        Some(e) if (8..total).contains(&done) => {
+            let s = (e / done as f32 * (total - done) as f32).ceil() as u32;
             Some(if s < 60 {
                 format!("{s} s left")
             } else {
@@ -138,10 +515,10 @@ fn loading(this: &Workbench, cx: &App) -> AnyElement {
                 .child(Progress::new("read").value(fraction * 100.))
                 .child(line(
                     muted(phase),
-                    muted(format!("{} of {} KB", kb(done), kb(SNAPSHOT_EXCHANGES))),
+                    muted(format!("{} of {} KB", kb(done), kb(total))),
                 ))
                 .child(line(
-                    muted(format!("{done} of {SNAPSHOT_EXCHANGES} requests")),
+                    muted(format!("{done} of {total} requests")),
                     muted(left.unwrap_or_default()),
                 )),
         )
@@ -207,7 +584,7 @@ fn disconnected(
 
 /// A single-choice segmented control.
 fn segmented(
-    id: &'static str,
+    id: impl Into<gpui_kit::ElementId>,
     labels: impl IntoIterator<Item = impl Into<SharedString>>,
     current: usize,
     disabled: bool,
@@ -242,12 +619,21 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
     let off = mode == 0;
     let picture = mode == 13;
     let can_paint = this.can_paint();
-    let options = keys::effect_options(mode);
-    let known = keys::EFFECTS.iter().any(|(m, _)| *m == mode);
+    let model = this.model();
+    let layout = model.layout();
+    let (width, height) = model.layout_size();
+    let options = model.options(mode);
+    let known = model.supports_effect(mode);
+    let side = draft
+        .advanced
+        .as_ref()
+        .and_then(|a| a.side_lighting.as_ref());
+    let side_preview = side.map(|l| effects::side_light(l, model));
 
     // The board plays the drafted effect. Painted pictures are static.
-    let moving = effects::moves(&light) && known;
-    let playing = this.preview.playing();
+    let moving =
+        (effects::moves(&light) && known) || side_preview.as_ref().is_some_and(effects::moves);
+    let playing = this.preview.playing() && !cx.reduce_motion();
     if moving && playing && window.is_window_active() {
         window.request_animation_frame();
     }
@@ -255,7 +641,7 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
     let level = f32::from(light.brightness.min(4)) / 4.;
     let rgb = draft.onboard.as_ref().map(|o| o.rgb.clone());
     let glow = |slot: u8| -> Option<gpui_kit::Hsla> {
-        if slot == KNOB_PRESS {
+        if model.knob_cap().is_some_and(|cap| cap.slot == slot) {
             return None;
         }
         if picture {
@@ -264,8 +650,8 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
             return (level > 0. && color.iter().any(|c| *c > 0))
                 .then(|| hsla([color[0], color[1], color[2]]).opacity(level));
         }
-        let cap = keys::LAYOUT.iter().find(|c| c.slot == slot)?;
-        effects::led(&light, now, cap)
+        let cap = layout.iter().find(|c| c.slot == slot)?;
+        effects::led_for(&light, now, cap, &layout, width, height)
     };
     let pick: Option<OnPick> = can_paint.then(|| {
         let entity = cx.entity();
@@ -273,18 +659,37 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
             entity.update(cx, |this, cx| this.paint(slot, cx));
         }) as Rc<dyn Fn(u8, &mut Window, &mut App)>
     });
-    let keyboard = board(
+    let side_glow = side_preview.map(|light| {
+        let strip: Vec<_> = (0..32)
+            .map(|i| keys::Cap {
+                slot: i,
+                usage: 0,
+                x: f32::from(i),
+                y: 0.,
+                w: 1.,
+                h: 1.,
+            })
+            .collect();
+        strip
+            .iter()
+            .map(|cap| effects::led_for(&light, now, cap, &strip, 32., 1.))
+            .collect()
+    });
+    let keyboard = board_lit(
         "light",
+        model,
         |slot| Look {
-            legend: keys::slot_legend(slot).into(),
+            legend: model.slot_legend(slot).into(),
             glow: glow(slot),
             ..Default::default()
         },
         pick,
+        side_glow,
         cx,
     );
 
-    let color_disabled = off || picture || light.rainbow;
+    let color_disabled =
+        off || picture || light.rainbow || model.effect(mode).is_some_and(|e| !e.rgb);
     let mut rows = vec![
         ui::icon_row(
             gpui_kit::assets::IconName::Sparkles,
@@ -305,7 +710,7 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
                         } else {
                             "Play preview"
                         })
-                        .disabled(!moving)
+                        .disabled(!moving || cx.reduce_motion())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.preview.toggle();
                             cx.notify();
@@ -335,13 +740,14 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
             gpui_kit::assets::IconName::Gauge,
             "Speed",
             ui::valued(
-                Slider::new(&this.speed).disabled(off || picture),
+                Slider::new(&this.speed)
+                    .disabled(off || picture || model.effect(mode).is_some_and(|e| e.speed == 0)),
                 format!("{}", light.speed),
                 cx,
             ),
         ),
     ];
-    if options > 1 {
+    if options.len() > 1 {
         rows.push(ui::icon_row(
             if picture {
                 gpui_kit::assets::IconName::Image
@@ -351,10 +757,16 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
             if picture { "Picture" } else { "Direction" },
             segmented(
                 "option",
-                (1..=options).map(|n| n.to_string()),
-                usize::from(light.option),
+                options
+                    .iter()
+                    .map(|(_, label)| label.clone())
+                    .collect::<Vec<_>>(),
+                options
+                    .iter()
+                    .position(|(value, _)| *value == light.option)
+                    .unwrap_or(0),
                 !known,
-                |this, i, _, cx| this.edit_light(cx, |l| l.option = i as u8),
+                move |this, i, _, cx| this.edit_light(cx, |l| l.option = options[i].0),
                 cx,
             ),
         ));
@@ -365,7 +777,7 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
             "Rainbow",
             Switch::new("rainbow")
                 .checked(light.rainbow)
-                .disabled(off || !known)
+                .disabled(off || !known || model.effect(mode).is_some_and(|e| !e.dazzle))
                 .on_click(cx.listener(|this, on: &bool, _, cx| {
                     let on = *on;
                     this.edit_light(cx, |l| l.rainbow = on);
@@ -406,6 +818,105 @@ fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbenc
     children.extend(paint_bar);
     children.push(keyboard.into_any_element());
     children.push(ui::section("", rows, cx));
+    if let Some(side) = side.cloned() {
+        let mut side_rows = vec![ui::icon_row(
+            gpui_kit::assets::IconName::Lightbulb,
+            "Effect",
+            segmented(
+                "side-effect",
+                ["Off", "Static", "Breathing", "Neon", "Wave", "Snake"],
+                usize::from(side.mode).min(5),
+                false,
+                move |this, i, _, cx| {
+                    this.edit(cx, |d| {
+                        if let Some(side) =
+                            d.advanced.as_mut().and_then(|a| a.side_lighting.as_mut())
+                        {
+                            side.mode = i as u8;
+                            side.flags = if i == 3 { 8 } else { model.normal };
+                        }
+                    })
+                },
+                cx,
+            ),
+        )];
+        for (index, label, value) in [
+            (0, "Brightness", side.brightness),
+            (1, "Speed", side.wire_speed),
+        ] {
+            side_rows.push(ui::icon_row(
+                gpui_kit::assets::IconName::Sun,
+                label,
+                segmented(
+                    SharedString::from(format!("side-value-{index}")),
+                    (0..=4).map(|n| n.to_string()),
+                    usize::from(value).min(4),
+                    false,
+                    move |this, v, _, cx| {
+                        this.edit(cx, |d| {
+                            if let Some(side) =
+                                d.advanced.as_mut().and_then(|a| a.side_lighting.as_mut())
+                            {
+                                if index == 0 {
+                                    side.brightness = v as u8;
+                                } else {
+                                    side.wire_speed = v as u8;
+                                }
+                            }
+                        })
+                    },
+                    cx,
+                ),
+            ));
+        }
+        side_rows.push(ui::icon_row(
+            gpui_kit::assets::IconName::Rainbow,
+            "Rainbow",
+            Switch::new("side-rainbow")
+                .checked(side.flags & 15 == model.dazzle)
+                .disabled(side.mode == 0 || side.mode == 3)
+                .on_click(cx.listener(move |this, on: &bool, _, cx| {
+                    this.edit(cx, |d| {
+                        if let Some(side) =
+                            d.advanced.as_mut().and_then(|a| a.side_lighting.as_mut())
+                        {
+                            side.flags =
+                                (side.flags & 0xf0) | if *on { model.dazzle } else { model.normal };
+                        }
+                    })
+                })),
+        ));
+        side_rows.push(ui::icon_row(
+            gpui_kit::assets::IconName::Palette,
+            "Color",
+            ColorPicker::new(&this.side_color)
+                .small()
+                .accessibility_label("Side lighting color"),
+        ));
+        if matches!(side.mode, 4 | 5) {
+            side_rows.push(ui::icon_row(
+                gpui_kit::assets::IconName::ArrowLeftRight,
+                "Direction",
+                segmented(
+                    "side-direction",
+                    ["Forward", "Reverse"],
+                    usize::from(side.flags >> 4).min(1),
+                    false,
+                    |this, i, _, cx| {
+                        this.edit(cx, |d| {
+                            if let Some(side) =
+                                d.advanced.as_mut().and_then(|a| a.side_lighting.as_mut())
+                            {
+                                side.flags = (side.flags & 15) | ((i as u8) << 4);
+                            }
+                        })
+                    },
+                    cx,
+                ),
+            ));
+        }
+        children.push(ui::section("Side lighting", side_rows, cx));
+    }
     ui::page("lighting", children).into_any_element()
 }
 
@@ -416,18 +927,25 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
     let baseline = this.baseline.clone();
     let fn_layer = this.fn_layer;
     let selected = this.selected;
-    let knob = |s: u8| matches!(s, KNOB_PRESS | KNOB_LEFT | KNOB_RIGHT);
+    let model = this.model();
+    let knob_slots = if model.knob_cap().is_some() {
+        model.knob_slots()
+    } else {
+        Vec::new()
+    };
+    let knob = |s: u8| knob_slots.contains(&s);
 
     let entity = cx.entity();
     let keyboard = board(
         "keys",
+        model,
         |slot| {
             let value = this.binding(&draft, slot);
             let base = baseline.as_ref().map(|b| this.binding(b, slot));
-            let remapped = value != keys::default_binding(fn_layer, slot);
+            let remapped = value != model.default_binding(fn_layer, this.layer, slot);
             let changed = base.is_some_and(|b| b != value);
             Look {
-                legend: keys::slot_legend(slot).into(),
+                legend: model.slot_legend(slot).into(),
                 action: (remapped || changed).then(|| keys::binding_label(value).into()),
                 selected: selected.is_some_and(|s| s == slot || (knob(s) && knob(slot))),
                 ..Default::default()
@@ -450,11 +968,35 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
         .gap_3()
         .child(segmented(
             "layer",
-            (1..=4).map(|n| format!("Layer {n}")),
-            usize::from(this.layer),
+            (1..=if fn_layer {
+                model.fn_maps()
+            } else {
+                model.layers
+            })
+                .map(|n| {
+                    if fn_layer {
+                        let (system, index) = model.fn_address(n - 1).expect("Fn map");
+                        format!(
+                            "{} Fn {}",
+                            if system == 0 { "Win" } else { "Mac" },
+                            index + 1
+                        )
+                    } else {
+                        format!("Layer {n}")
+                    }
+                }),
+            usize::from(if model.magnetic && !fn_layer {
+                this.layer / 4
+            } else {
+                this.layer
+            }),
             false,
             |this, i, window, cx| {
-                this.layer = i as u8;
+                this.layer = if this.model().magnetic && !this.fn_layer {
+                    i as u8 * 4 + this.layer % 4
+                } else {
+                    i as u8
+                };
                 this.sync_target(window, cx);
             },
             cx,
@@ -466,6 +1008,13 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
             false,
             |this, i, window, cx| {
                 this.fn_layer = i == 1;
+                this.layer = this.layer.min(
+                    if this.fn_layer {
+                        this.model().fn_maps()
+                    } else {
+                        this.model().base_maps()
+                    } - 1,
+                );
                 this.sync_target(window, cx);
             },
             cx,
@@ -483,27 +1032,42 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
                 })),
         );
 
+    let outputs = if model.magnetic && !fn_layer {
+        segmented(
+            "binding-output",
+            ["Primary", "Output 2", "Output 3", "Output 4"],
+            usize::from(this.layer % 4),
+            false,
+            |this, i, window, cx| {
+                this.layer = this.layer / 4 * 4 + i as u8;
+                this.sync_target(window, cx);
+            },
+            cx,
+        )
+        .into_any_element()
+    } else {
+        div().into_any_element()
+    };
     let editor = match selected {
         None => ui::placeholder("No key selected", 120., cx).into_any_element(),
         Some(slot) => {
             let value = this.binding(&draft, slot);
             let mut rows = Vec::new();
             if knob(slot) {
-                let current = match slot {
-                    KNOB_LEFT => 1,
-                    KNOB_RIGHT => 2,
-                    _ => 0,
-                };
+                let current = knob_slots.iter().position(|s| *s == slot).unwrap_or(0);
                 rows.push(ui::icon_row(
                     gpui_kit::assets::IconName::CircleDot,
                     "Input",
                     segmented(
                         "knob",
-                        ["Press", "Turn left", "Turn right"],
+                        knob_slots
+                            .iter()
+                            .map(|slot| model.slot_legend(*slot))
+                            .collect::<Vec<_>>(),
                         current,
                         false,
-                        |this, i, window, cx| {
-                            let slot = [KNOB_PRESS, KNOB_LEFT, KNOB_RIGHT][i];
+                        move |this, i, window, cx| {
+                            let slot = knob_slots[i];
                             this.select_key(Some(slot), window, cx);
                         },
                         cx,
@@ -515,6 +1079,7 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
                 "Action",
                 div().w(px(200.)).child(
                     Select::new(&this.target)
+                        .disabled(!model.is_remappable(slot))
                         .small()
                         .appearance(false)
                         .menu_width(px(280.))
@@ -560,7 +1125,7 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
                         })),
                 ));
             }
-            ui::section(keys::slot_name(slot), rows, cx)
+            ui::section(model.slot_legend(slot), rows, cx)
         }
     };
 
@@ -568,6 +1133,7 @@ fn keys_page(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) 
         "keys",
         vec![
             toolbar.into_any_element(),
+            outputs,
             keyboard.into_any_element(),
             editor,
         ],
@@ -947,7 +1513,9 @@ fn performance(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement 
         ]
         .into_iter()
         .zip(this.sleep.iter())
-        .map(|((icon, label, value), state)| {
+        .enumerate()
+        .filter(|(i, _)| this.model().sleep_ranges[*i].is_some())
+        .map(|(_, ((icon, label, value), state))| {
             ui::icon_row(
                 icon,
                 label,
@@ -957,7 +1525,95 @@ fn performance(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement 
         .collect(),
         cx,
     );
-    ui::page("performance", vec![input, sleep]).into_any_element()
+    let mut parts = Vec::new();
+    if this.model().debounce {
+        parts.push(input);
+    }
+    if let Some(hz) = this
+        .draft
+        .as_ref()
+        .and_then(|d| d.advanced.as_ref())
+        .and_then(|a| a.report_rate)
+    {
+        let rates: Vec<u16> = [125, 250, 500, 1000, 2000, 4000, 8000]
+            .into_iter()
+            .filter(|r| *r <= this.model().max_report_rate)
+            .collect();
+        parts.push(ui::section(
+            "Polling",
+            vec![ui::icon_row(
+                I::Gauge,
+                "Report rate",
+                segmented(
+                    "report-rate",
+                    rates.iter().map(|r| format!("{r} Hz")).collect::<Vec<_>>(),
+                    rates.iter().position(|r| *r == hz).unwrap_or(3),
+                    false,
+                    move |this, i, _, cx| {
+                        this.edit(cx, |d| {
+                            if let Some(a) = &mut d.advanced {
+                                a.report_rate = Some(rates[i]);
+                            }
+                        })
+                    },
+                    cx,
+                ),
+            )],
+            cx,
+        ));
+    }
+    if let Some(a) = this.draft.as_ref().and_then(|d| d.advanced.clone()) {
+        if let Some(value) = a.magnetic_mode {
+            parts.push(ui::section(
+                "Actuation preset",
+                vec![
+                    segmented(
+                        "magnetic-preset",
+                        ["Comfort", "Sensitive", "Gaming", "Custom"],
+                        usize::from(value),
+                        false,
+                        |this, i, _, cx| {
+                            this.edit(cx, |d| {
+                                if let Some(a) = &mut d.advanced {
+                                    a.magnetic_mode = Some(i as u8);
+                                }
+                            })
+                        },
+                        cx,
+                    )
+                    .into_any_element(),
+                ],
+                cx,
+            ));
+        }
+        if let Some(value) = a.output_mode {
+            parts.push(ui::section(
+                "Output",
+                vec![
+                    segmented(
+                        "output-mode",
+                        ["Keyboard", "Gamepad"],
+                        usize::from(value),
+                        false,
+                        |this, i, _, cx| {
+                            this.edit(cx, |d| {
+                                if let Some(a) = &mut d.advanced {
+                                    a.output_mode = Some(i as u8);
+                                }
+                            })
+                        },
+                        cx,
+                    )
+                    .into_any_element(),
+                ],
+                cx,
+            ));
+        }
+    }
+    if this.model().sleep {
+        parts.push(sleep);
+    }
+    ui::page("performance", parts).into_any_element()
 }
 
 // ---- System ---------------------------------------------------------------
@@ -976,7 +1632,7 @@ fn system(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
             "Active layer",
             segmented(
                 "active-layer",
-                (1..=4).map(|n| n.to_string()),
+                (1..=this.model().layers).map(|n| n.to_string()),
                 usize::from(d.active_layer),
                 this.busy.is_some(),
                 |this, i, _, cx| this.edit(cx, |d| d.active_layer = i as u8),
@@ -1006,7 +1662,7 @@ fn system(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
                 })),
         )
     };
-    let keyboard = ui::section(
+    let legacy_keyboard = ui::section(
         "Keyboard",
         vec![
             bit(I::Lock, "Windows key lock", "win-lock", 0, 1),
@@ -1027,6 +1683,85 @@ fn system(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
         ],
         cx,
     );
+    let keyboard = if let Some(bytes) = d.advanced.as_ref().and_then(|a| a.options) {
+        let modern_switch = |label: &'static str, id: &'static str, index: usize| {
+            ui::icon_row(
+                I::Keyboard,
+                label,
+                Switch::new(id)
+                    .checked(bytes[index] != 0)
+                    .on_click(cx.listener(move |this, on: &bool, _, cx| {
+                        this.edit(cx, |d| {
+                            if let Some(options) =
+                                d.advanced.as_mut().and_then(|a| a.options.as_mut())
+                            {
+                                options[index] = u8::from(*on);
+                            }
+                        })
+                    })),
+            )
+        };
+        ui::section(
+            "Keyboard",
+            vec![
+                modern_switch("Prevent accidental presses", "anti-mistouch", 1),
+                modern_switch("Swap WASD and arrows", "modern-wasd", 3),
+                ui::icon_row(
+                    I::Monitor,
+                    "Automatic OS detection",
+                    Switch::new("modern-auto-os")
+                        .checked(o.auto_os)
+                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                            this.edit_onboard(cx, |o| o.auto_os = *on)
+                        })),
+                ),
+                ui::icon_row(
+                    I::Gauge,
+                    "Rapid trigger stability",
+                    segmented(
+                        "rt-stability",
+                        ["Off", "25", "50", "75", "100", "125"],
+                        usize::from(bytes[2]).min(5),
+                        false,
+                        |this, i, _, cx| {
+                            this.edit(cx, |d| {
+                                if let Some(options) =
+                                    d.advanced.as_mut().and_then(|a| a.options.as_mut())
+                                {
+                                    options[2] = i as u8;
+                                }
+                            })
+                        },
+                        cx,
+                    ),
+                ),
+                ui::icon_row(
+                    I::Layers,
+                    "Fn map",
+                    segmented(
+                        "fn-index",
+                        (1..=this.model().fn_counts.get("win").copied().unwrap_or(1))
+                            .map(|n| n.to_string()),
+                        usize::from(bytes[0]),
+                        false,
+                        |this, i, _, cx| {
+                            this.edit(cx, |d| {
+                                if let Some(options) =
+                                    d.advanced.as_mut().and_then(|a| a.options.as_mut())
+                                {
+                                    options[0] = i as u8;
+                                }
+                            })
+                        },
+                        cx,
+                    ),
+                ),
+            ],
+            cx,
+        )
+    } else {
+        legacy_keyboard
+    };
     let installed = this.access == monsgeek_linux::access::Status::Installed;
     let access = ui::section(
         "Access",
@@ -1158,6 +1893,7 @@ fn backups(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
                 .small()
                 .icon(gpui_kit::assets::IconName::Download)
                 .label("Export")
+                .disabled(this.previewing)
                 .on_click(cx.listener(|this, _, window, cx| this.export(window, cx))),
         )
         .child(

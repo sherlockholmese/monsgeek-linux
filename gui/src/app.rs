@@ -2,6 +2,7 @@
 //! state of each page. Every edit changes only the draft; Apply sends the
 //! difference as one verified transaction with a saved before-state.
 use std::{
+    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Instant,
@@ -12,6 +13,7 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants},
     color_picker::{ColorPickerEvent, ColorPickerState},
     h_flex,
+    input::{InputEvent, InputState},
     notification::Notification,
     select::{SelectEvent, SelectState},
     sidebar::{Sidebar, SidebarFooter, SidebarMenu, SidebarMenuItem},
@@ -28,7 +30,7 @@ use monsgeek_linux::{
     config::{Macro, MacroEvent},
     device::{Onboard, Snapshot},
     firmware::{self, Image},
-    keys::{self, EFFECTS, TARGETS},
+    keys::{EFFECTS, TARGETS},
     protocol::{Change, Lighting},
     transaction,
     transport::Kind,
@@ -44,6 +46,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Page {
     Lighting,
+    Models,
+    Magnetic,
     Keys,
     Macros,
     Performance,
@@ -58,8 +62,9 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 12] = [
+    pub const ALL: [Page; 14] = [
         Page::Lighting,
+        Page::Magnetic,
         Page::Keys,
         Page::Macros,
         Page::Performance,
@@ -71,11 +76,14 @@ impl Page {
         Page::Host,
         Page::Desktop,
         Page::Logs,
+        Page::Models,
     ];
 
     pub fn title(self) -> &'static str {
         match self {
             Page::Lighting => "Lighting",
+            Page::Models => "Keyboard models",
+            Page::Magnetic => "Actuation",
             Page::Keys => "Keys",
             Page::Macros => "Macros",
             Page::Performance => "Performance",
@@ -94,6 +102,8 @@ impl Page {
         use gpui_kit::assets::IconName as L;
         Icon::new(match self {
             Page::Lighting => L::Lightbulb,
+            Page::Models => L::Keyboard,
+            Page::Magnetic => L::Gauge,
             Page::Keys => L::Keyboard,
             Page::Macros => L::ListVideo,
             Page::Performance => L::Gauge,
@@ -121,6 +131,7 @@ pub enum Busy {
     Applying,
     Flashing,
     Capturing,
+    Calibrating,
 }
 
 /// Decoded lighting controls. `rgb` survives picture mode, which stores a
@@ -136,15 +147,21 @@ pub struct Light {
 }
 
 impl Light {
-    fn decode(l: &Lighting, last_rgb: [u8; 3]) -> Self {
+    pub(crate) fn decode(
+        l: &Lighting,
+        last_rgb: [u8; 3],
+        model: &monsgeek_linux::models::Model,
+    ) -> Self {
         Self {
             mode: l.mode,
-            speed: 5u8.saturating_sub(l.wire_speed).min(4),
+            speed: model.wire_max_speed().saturating_sub(l.wire_speed).min(4),
             brightness: l.brightness.min(4),
             option: l.flags >> 4,
-            rainbow: l.flags & 0x0f == 7,
+            rainbow: l.flags & 0x0f == model.dazzle,
             rgb: if l.mode == 13 {
                 last_rgb
+            } else if (l.flags & 15) < 7 {
+                model.palette[usize::from(l.flags & 15)]
             } else if l.rgb == [250, 255, 250] {
                 [255; 3]
             } else {
@@ -168,6 +185,13 @@ pub struct Workbench {
     pub busy: Option<Busy>,
     pub baseline: Option<Snapshot>,
     pub draft: Option<Snapshot>,
+    pub previewing: bool,
+    pub model_select: Entity<SelectState<Vec<SharedString>>>,
+    pub preview_model: u32,
+    pub snap_select: Entity<SelectState<Vec<SharedString>>>,
+    pub switch_select: Entity<SelectState<Vec<SharedString>>>,
+    pub magnetic_inputs: BTreeMap<u8, Entity<InputState>>,
+    pub magnetic_errors: BTreeMap<u8, String>,
     pub history: Vec<Record>,
     /// Latest background poll; `None` before the first one.
     pub presence: Option<device::Presence>,
@@ -207,6 +231,7 @@ pub struct Workbench {
     pub effect: Entity<SelectState<Vec<SharedString>>>,
     pub target: Entity<SelectState<Vec<SharedString>>>,
     pub color: Entity<ColorPickerState>,
+    pub side_color: Entity<ColorPickerState>,
     pub brightness: Entity<SliderState>,
     pub speed: Entity<SliderState>,
     pub debounce: Entity<SliderState>,
@@ -508,6 +533,7 @@ impl Workbench {
         let failed = matches!(self.link, Link::Failed(_));
         if now.reachable()
             && self.baseline.is_none()
+            && !self.previewing
             && (before.is_some() && !was.reachable() || before.is_none() && failed)
         {
             self.reload(window, cx);
@@ -517,13 +543,45 @@ impl Workbench {
 
     /// Construct without touching the device.
     fn build(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let snap_select = cx.new(|cx| {
+            SelectState::new(Vec::<SharedString>::new(), None, window, cx).searchable(true)
+        });
+        let switch_select =
+            cx.new(|cx| SelectState::new(Vec::<SharedString>::new(), None, window, cx));
+        let model_select = cx.new(|cx| {
+            SelectState::new(
+                monsgeek_linux::models::MODELS
+                    .iter()
+                    .map(|m| SharedString::from(format!("{} (ID {})", m.name, m.id)))
+                    .collect::<Vec<_>>(),
+                None,
+                window,
+                cx,
+            )
+            .searchable(true)
+        });
         let effects: Vec<SharedString> = EFFECTS.iter().map(|(_, n)| (*n).into()).collect();
         let effect = cx.new(|cx| SelectState::new(effects, None, window, cx));
         let targets: Vec<SharedString> = TARGETS.iter().map(|t| t.label.clone().into()).collect();
         let target = cx.new(|cx| SelectState::new(targets, None, window, cx).searchable(true));
+        let side_color =
+            cx.new(|cx| ColorPickerState::new(window, cx).default_value(hsla([255; 3])));
         let color = cx.new(|cx| ColorPickerState::new(window, cx).default_value(hsla([255; 3])));
         let brightness = slider(0., 4., cx);
         let speed = slider(0., 4., cx);
+        let magnetic_inputs: BTreeMap<_, _> = [0, 1, 2, 3, 4, 5, 6, 251]
+            .into_iter()
+            .map(|p| {
+                (
+                    p,
+                    cx.new(|cx| {
+                        InputState::new(window, cx).validate(|text, _| {
+                            text.chars().all(|c| c.is_ascii_digit() || c == '.')
+                        })
+                    }),
+                )
+            })
+            .collect();
         let debounce = slider(1., 10., cx);
         let sleep = [
             slider(1., 60., cx),
@@ -533,6 +591,94 @@ impl Workbench {
         ];
 
         let mut subs = vec![
+            cx.subscribe_in(
+                &side_color,
+                window,
+                |this, _, ev: &ColorPickerEvent, _, cx| {
+                    let ColorPickerEvent::Change(Some(color)) = ev else {
+                        return;
+                    };
+                    let rgb = rgb_of(*color);
+                    this.edit(cx, |d| {
+                        if let Some(settings) =
+                            d.advanced.as_mut().and_then(|s| s.side_lighting.as_mut())
+                        {
+                            settings.rgb = if rgb == [255; 3] {
+                                [250, 255, 250]
+                            } else {
+                                rgb
+                            };
+                        }
+                    });
+                },
+            ),
+            cx.subscribe_in(
+                &snap_select,
+                window,
+                |this, _, ev: &SelectEvent<_>, _, cx| {
+                    if let SelectEvent::Confirm(Some(name)) = ev
+                        && let Some(slot) = this.selected
+                    {
+                        let peer = this
+                            .model()
+                            .layout()
+                            .into_iter()
+                            .find(|cap| this.model().slot_name(cap.slot) == name.as_ref())
+                            .map(|cap| cap.slot);
+                        this.edit(cx, |d| {
+                            if let Some(s) = &mut d.advanced {
+                                if let Some(peer) = peer {
+                                    let _ = s.pair(slot, peer);
+                                } else {
+                                    let rapid = s
+                                        .magnetic
+                                        .get(&7)
+                                        .is_some_and(|m| m[usize::from(slot)] & 128 != 0);
+                                    let _ = s.set_mode(slot, 0, rapid);
+                                }
+                            }
+                        });
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &switch_select,
+                window,
+                |this, _, ev: &SelectEvent<_>, _, cx| {
+                    if let SelectEvent::Confirm(Some(name)) = ev
+                        && let Some(slot) = this.selected
+                        && let Some(code) = this
+                            .model()
+                            .switches
+                            .iter()
+                            .find(|s| s.label == name.as_ref())
+                            .map(|s| s.code)
+                    {
+                        let model = this.model();
+                        this.edit(cx, |d| {
+                            if let Some(s) = &mut d.advanced {
+                                let _ = s.set_value(model, 252, slot, f32::from(code));
+                            }
+                        });
+                    }
+                },
+            ),
+            cx.subscribe_in(
+                &model_select,
+                window,
+                |this, _, ev: &SelectEvent<_>, _, cx| {
+                    if let SelectEvent::Confirm(Some(name)) = ev
+                        && let Some(id) = name
+                            .rsplit(" (ID ")
+                            .next()
+                            .and_then(|n| n.strip_suffix(')'))
+                            .and_then(|n| n.parse().ok())
+                    {
+                        this.preview_model = id;
+                        cx.notify();
+                    }
+                },
+            ),
             cx.subscribe_in(&effect, window, |this, _, ev: &SelectEvent<_>, _, cx| {
                 let SelectEvent::Confirm(Some(name)) = ev else {
                     return;
@@ -546,7 +692,12 @@ impl Workbench {
                 let SelectEvent::Confirm(Some(name)) = ev else {
                     return;
                 };
-                if let Some(t) = TARGETS.iter().find(|t| t.label == name.as_ref()) {
+                if let Some(t) = this
+                    .model()
+                    .targets()
+                    .iter()
+                    .find(|t| t.label == name.as_ref())
+                {
                     let value = t.value;
                     this.bind_selected(value, cx);
                 }
@@ -575,11 +726,47 @@ impl Workbench {
                 this.edit_onboard(cx, |o| o.debounce = v);
             }),
         ];
+        for (&parameter, input) in &magnetic_inputs {
+            subs.push(cx.subscribe_in(
+                input,
+                window,
+                move |this, input, event: &InputEvent, _, cx| {
+                    if !matches!(event, InputEvent::Change | InputEvent::PressEnter { .. })
+                        || !this.editable()
+                    {
+                        return;
+                    }
+                    let Some(slot) = this.selected else {
+                        return;
+                    };
+                    let Some(mut settings) = this.draft.as_ref().and_then(|d| d.advanced.clone())
+                    else {
+                        return;
+                    };
+                    let result = input
+                        .read(cx)
+                        .value()
+                        .parse::<f32>()
+                        .map_err(|_| anyhow::anyhow!("Enter a number"))
+                        .and_then(|value| settings.set_value(this.model(), parameter, slot, value));
+                    match result {
+                        Ok(()) => {
+                            this.magnetic_errors.remove(&parameter);
+                            this.edit(cx, |d| d.advanced = Some(settings));
+                        }
+                        Err(error) => {
+                            this.magnetic_errors.insert(parameter, error.to_string());
+                            cx.notify();
+                        }
+                    }
+                },
+            ));
+        }
         for (i, s) in sleep.iter().enumerate() {
             subs.push(
                 cx.subscribe_in(s, window, move |this, _, ev: &SliderEvent, _, cx| {
                     let SliderEvent::Change(v) = ev else { return };
-                    let seconds = single(v) as u16 * 60;
+                    let seconds = single(v) as u16;
                     this.edit_onboard(cx, |o| match i {
                         0 => o.sleep.time_bt = seconds,
                         1 => o.sleep.time_24 = seconds,
@@ -629,6 +816,13 @@ impl Workbench {
             busy: None,
             baseline: None,
             draft: None,
+            previewing: false,
+            preview_model: 983,
+            model_select,
+            snap_select,
+            switch_select,
+            magnetic_inputs,
+            magnetic_errors: BTreeMap::new(),
             history: device::history(),
             logs: Vec::new(),
             errors_only: false,
@@ -659,6 +853,7 @@ impl Workbench {
             effect,
             target,
             color,
+            side_color,
             brightness,
             speed,
             debounce,
@@ -675,6 +870,12 @@ impl Workbench {
         cx: &mut Context<Self>,
     ) {
         self.link = Link::Ready;
+        self.previewing = false;
+        self.layer = 0;
+        self.fn_layer = false;
+        self.selected = None;
+        self.features.live_travel = false;
+        self.features.travel.clear();
         self.baseline = Some(snapshot.clone());
         self.draft = Some(snapshot);
         self.sync_controls(window, cx);
@@ -683,7 +884,7 @@ impl Workbench {
     // ---- Device ----------------------------------------------------------
 
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.features.calibrating {
             return;
         }
         self.busy = Some(Busy::Reading);
@@ -776,6 +977,13 @@ impl Workbench {
     }
 
     pub fn apply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.features.calibrating {
+            window.push_notification(
+                Notification::error("Finish calibration before applying changes"),
+                cx,
+            );
+            return;
+        }
         if self.features.host_process.is_some() {
             window.push_notification(
                 Notification::error("Stop host remapping before applying keyboard changes"),
@@ -786,7 +994,7 @@ impl Workbench {
         let (Some(baseline), Some(draft)) = (self.baseline.clone(), self.draft.clone()) else {
             return;
         };
-        if self.busy.is_some() {
+        if self.busy.is_some() || self.previewing {
             return;
         }
         let changes = match self.pending() {
@@ -852,6 +1060,13 @@ impl Workbench {
     /// Load a snapshot as the draft; Apply then writes only its differences.
     pub fn restore(&mut self, target: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
         let Some(base) = &self.baseline else { return };
+        if target.device_id != base.device_id {
+            window.push_notification(
+                Notification::error("Snapshot is from another keyboard model"),
+                cx,
+            );
+            return;
+        }
         if target.usb_revision != base.usb_revision {
             self.log(Entry::new(
                 Level::Error,
@@ -884,6 +1099,9 @@ impl Workbench {
     }
 
     pub fn export(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.previewing {
+            return;
+        }
         let Some(snapshot) = self.baseline.clone() else {
             return;
         };
@@ -894,7 +1112,10 @@ impl Workbench {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        let path = cx.prompt_for_new_path(&dir, Some(&format!("m1w-{ms}.json")));
+        let path = cx.prompt_for_new_path(
+            &dir,
+            Some(&format!("monsgeek-{}-{ms}.json", self.model().id)),
+        );
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(path))) = path.await else {
                 return;
@@ -960,6 +1181,113 @@ impl Workbench {
         .detach();
     }
 
+    pub fn confirm_calibration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let view = cx.entity();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let view = view.clone();
+            dialog.title("Calibrate switches?").w(px(520.))
+                .child(div().text_sm().child("Keep the keyboard connected by USB. After starting, press each key fully and hold it for at least one second. Finish when every key has been pressed. Sensor calibration cannot be undone with a configuration backup."))
+                .footer(h_flex().w_full().justify_end().gap_2()
+                    .child(Button::new("calibration-cancel").ghost().label("Cancel").on_click(|_, window, cx| window.close_dialog(cx)))
+                    .child(Button::new("calibration-start").primary().label("Start calibration").on_click(move |_, window, cx| { window.close_dialog(cx); view.update(cx, |this, cx| this.run_calibration(true, window, cx)); })))
+        });
+    }
+
+    pub fn run_calibration(&mut self, start: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy.is_some()
+            || (start && self.features.calibrating)
+            || self.previewing
+            || self.transport != Some(Kind::Usb)
+            || !self.model().magnetic
+            || (start && !self.pending().is_ok_and(|p| p.is_empty()))
+        {
+            return;
+        }
+        let model = self.model().id;
+        self.busy = Some(Busy::Calibrating);
+        // A failed start may have reached the keyboard. Keep Finish available
+        // and block other writes until the session has explicitly ended.
+        if start {
+            self.features.calibrating = true;
+        }
+        self.features.live_travel = false;
+        self.features.calibration_status = if start {
+            "Preparing calibration…"
+        } else {
+            "Finishing calibration…"
+        }
+        .into();
+        let task = cx.background_spawn(async move { device::calibrate(start, model) });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = task.await;
+            this.update_in(cx, |this, window, cx| {
+                this.busy = None;
+                match result {
+                    Ok(path) => {
+                        this.features.calibrating = start;
+                        this.features.calibration_status = if start { "Press every key fully, then finish calibration." } else { "Calibration finish command sent. Test the keys before applying further changes." }.into();
+                        this.log(Entry::new(Level::Info, if start { "Calibration started" } else { "Calibration finished" }, vec![path.display().to_string()]));
+                        if start { this.toggle_travel(window, cx); }
+                    }
+                    Err(error) => { this.features.calibration_status = "Calibration interrupted. Keep USB connected and finish calibration.".into(); this.log(Entry::error("Calibration failed", &error)); }
+                }
+                cx.notify();
+            }).ok();
+        }).detach();
+        cx.notify();
+    }
+
+    pub fn toggle_travel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.previewing || self.busy.is_some() || !self.model().magnetic {
+            return;
+        }
+        self.features.live_travel = !self.features.live_travel;
+        if !self.features.live_travel {
+            cx.notify();
+            return;
+        }
+        let model = self.model().id;
+        cx.spawn_in(window, async move |this, cx| {
+            loop {
+                let active = this.update(cx, |this, _| {
+                    this.features.live_travel
+                        && !this.previewing
+                        && this.model().id == model
+                        && this.busy.is_none()
+                });
+                if !matches!(active, Ok(true)) {
+                    let _ = this.update(cx, |this, cx| {
+                        this.features.live_travel = false;
+                        cx.notify();
+                    });
+                    break;
+                }
+                let result = cx
+                    .background_spawn(async move { device::travel(model) })
+                    .await;
+                let keep = this.update_in(cx, |this, _, cx| {
+                    match result {
+                        Ok(values) => this.features.travel = values,
+                        Err(error) => {
+                            this.features.calibration_status = first_line(&error).to_string();
+                            this.features.live_travel = false;
+                        }
+                    }
+                    cx.notify();
+                    this.features.live_travel
+                });
+                if !matches!(keep, Ok(true)) {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
     // ---- Experimental firmware ------------------------------------------
 
     pub fn choose_firmware(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -970,7 +1298,7 @@ impl Workbench {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Select original M1W firmwareFile.bin".into()),
+            prompt: Some(format!("Select {} firmwareFile.bin", self.model().name).into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else {
@@ -980,8 +1308,11 @@ impl Workbench {
                 return;
             };
             let load_path = path.clone();
+            let Ok(model) = this.update(cx, |this, _| this.model()) else {
+                return;
+            };
             let result = cx
-                .background_spawn(async move { Image::load(&load_path) })
+                .background_spawn(async move { Image::load_for(&load_path, model) })
                 .await;
             this.update_in(cx, |this, window, cx| {
                 match result {
@@ -1012,8 +1343,13 @@ impl Workbench {
         self.busy.is_none()
             && self.features.host_process.is_none()
             && self.transport == Some(Kind::Usb)
+            && !self.previewing
+            && !self.features.calibrating
             && self.baseline.is_some()
-            && self.firmware_image.is_some()
+            && self
+                .firmware_image
+                .as_ref()
+                .is_some_and(|(_, image)| image.info().target_device_id == self.model().id)
             && self.pending().is_ok_and(|changes| changes.is_empty())
     }
 
@@ -1030,6 +1366,7 @@ impl Workbench {
             .to_string_lossy()
             .to_string();
         let hash = image.info().sha256.clone();
+        let model = self.model();
         let view = cx.entity();
         window.open_dialog(cx, move |dialog, _, cx| {
             let flash = view.clone();
@@ -1042,11 +1379,10 @@ impl Workbench {
                         .gap_3()
                         .child(filename.clone())
                         .child(div().text_sm().child(firmware::WARNING))
-                        .child(
-                            div().text_sm().child(
-                                "Use only original M1W firmware. The file model is unverified.",
-                            ),
-                        )
+                        .child(div().text_sm().child(format!(
+                            "Use only firmware for {} (ID{}). The file model is unverified.",
+                            model.name, model.id
+                        )))
                         .child(
                             div()
                                 .text_xs()
@@ -1191,6 +1527,13 @@ impl Workbench {
     // ---- Draft edits -----------------------------------------------------
 
     pub fn pending(&self) -> anyhow::Result<Vec<Change>> {
+        anyhow::ensure!(
+            self.magnetic_errors.is_empty(),
+            "Correct the actuation value before applying changes"
+        );
+        if self.previewing {
+            return Ok(Vec::new());
+        }
         match (&self.baseline, &self.draft) {
             (Some(b), Some(d)) => {
                 let changes = b.restore_changes(d)?;
@@ -1223,10 +1566,17 @@ impl Workbench {
         });
     }
 
+    pub fn model(&self) -> &'static monsgeek_linux::models::Model {
+        self.draft
+            .as_ref()
+            .and_then(|d| d.model().ok())
+            .unwrap_or_else(monsgeek_linux::models::original)
+    }
+
     pub fn light(&self) -> Option<Light> {
         self.draft
             .as_ref()
-            .map(|d| Light::decode(&d.lighting, self.last_rgb))
+            .map(|d| Light::decode(&d.lighting, self.last_rgb, self.model()))
     }
 
     pub fn edit_light(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Light)) {
@@ -1238,9 +1588,12 @@ impl Workbench {
         if light == before {
             return;
         }
-        let max = keys::effect_options(light.mode) - 1;
-        light.option = light.option.min(max);
-        if let Ok(settings) = Lighting::new(
+        let options = self.model().options(light.mode);
+        if !options.iter().any(|(value, _)| *value == light.option) {
+            light.option = options.first().map_or(0, |(value, _)| *value);
+        }
+        if let Ok(mut settings) = Lighting::new_for(
+            self.model(),
             light.mode,
             light.speed,
             light.brightness,
@@ -1248,6 +1601,22 @@ impl Workbench {
             light.rainbow,
             light.rgb,
         ) {
+            if let Some(old) = self.draft.as_ref().map(|d| &d.lighting) {
+                if light.mode == before.mode
+                    && light.option == before.option
+                    && light.rainbow == before.rainbow
+                    && light.rgb == before.rgb
+                {
+                    settings.flags = old.flags;
+                    settings.rgb = old.rgb;
+                }
+                if light.speed == before.speed {
+                    settings.wire_speed = old.wire_speed;
+                }
+                if light.brightness == before.brightness {
+                    settings.brightness = old.brightness;
+                }
+            }
             self.edit(cx, |d| d.lighting = settings);
         }
     }
@@ -1255,6 +1624,9 @@ impl Workbench {
     /// Whether per-key colors can be edited: the device must already show the
     /// same custom picture, because a snapshot holds only the selected one.
     pub fn can_paint(&self) -> bool {
+        if self.previewing {
+            return self.draft.as_ref().is_some_and(|d| d.lighting.mode == 13);
+        }
         match (&self.baseline, &self.draft) {
             (Some(b), Some(d)) => {
                 b.lighting.mode == 13
@@ -1281,9 +1653,11 @@ impl Workbench {
             return;
         }
         let rgb = self.last_rgb;
+        let slots: Vec<_> = self.model().layout().into_iter().map(|c| c.slot).collect();
         self.edit_onboard(cx, |o| {
-            for px in o.rgb.chunks_mut(3) {
-                px.copy_from_slice(&rgb);
+            for slot in slots {
+                let i = usize::from(slot) * 3;
+                o.rgb[i..i + 3].copy_from_slice(&rgb);
             }
         });
     }
@@ -1315,19 +1689,128 @@ impl Workbench {
 
     fn bind_selected(&mut self, value: Option<[u8; 4]>, cx: &mut Context<Self>) {
         let Some(slot) = self.selected else { return };
-        let value = value.unwrap_or_else(|| keys::default_binding(self.fn_layer, slot));
+        let value = value.unwrap_or_else(|| {
+            self.model()
+                .default_binding(self.fn_layer, self.layer, slot)
+        });
         self.set_binding(slot, value, cx);
     }
 
     pub fn reset_layer(&mut self, cx: &mut Context<Self>) {
         for slot in 0..128 {
-            let value = keys::default_binding(self.fn_layer, slot);
+            if !self.model().is_remappable(slot) {
+                continue;
+            }
+            let value = self
+                .model()
+                .default_binding(self.fn_layer, self.layer, slot);
             self.set_binding(slot, value, cx);
         }
     }
 
+    pub(crate) fn sync_magnetic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.magnetic_errors.clear();
+        let model = self.model();
+        let slot = self.selected;
+        if let Some(settings) = self.draft.as_ref().and_then(|d| d.advanced.as_ref())
+            && let Some(slot) = slot
+        {
+            for (&parameter, input) in &self.magnetic_inputs {
+                if let Some(value) = settings.value(model, parameter, slot) {
+                    let (min, max, step) = settings.bounds(model, parameter);
+                    input.update(cx, |state, cx| {
+                        state.set_min(Some(f64::from(min)), window, cx);
+                        state.set_max(Some(f64::from(max)), window, cx);
+                        state.set_step(
+                            Some(
+                                format!("{step:.4}")
+                                    .parse::<f64>()
+                                    .expect("finite step")
+                                    .into(),
+                            ),
+                            window,
+                            cx,
+                        );
+                        state.set_value(
+                            if parameter == 5 {
+                                format!("{value:.0}")
+                            } else {
+                                format!("{value:.3}")
+                            },
+                            window,
+                            cx,
+                        );
+                    });
+                }
+            }
+        }
+        let peers: Vec<SharedString> = std::iter::once(SharedString::from("None"))
+            .chain(
+                model
+                    .layout()
+                    .into_iter()
+                    .filter(|c| c.usage != 0 && Some(c.slot) != slot)
+                    .map(|c| SharedString::from(model.slot_name(c.slot))),
+            )
+            .collect();
+        let peer = slot.and_then(|slot| {
+            let magnetic = &self.draft.as_ref()?.advanced.as_ref()?.magnetic;
+            if magnetic.get(&7)?[usize::from(slot)] & 127 != 7 {
+                return None;
+            }
+            magnetic.get(&9)?.get(usize::from(slot)).copied()
+        });
+        let current = peer
+            .and_then(|peer| {
+                peers
+                    .iter()
+                    .find(|name| name.as_ref() == model.slot_name(peer))
+                    .cloned()
+            })
+            .or_else(|| Some(SharedString::from("None")));
+        self.snap_select.update(cx, |state, cx| {
+            state.set_items(peers, window, cx);
+            if let Some(current) = current {
+                state.set_selected_value(&current, window, cx);
+            } else {
+                state.set_selected_index(None, window, cx);
+            }
+        });
+        let switches: Vec<SharedString> = model
+            .switches
+            .iter()
+            .map(|s| s.label.clone().into())
+            .collect();
+        let code = slot.and_then(|slot| {
+            self.draft
+                .as_ref()?
+                .advanced
+                .as_ref()?
+                .magnetic
+                .get(&252)?
+                .get(usize::from(slot))
+                .copied()
+        });
+        let current = code.and_then(|code| {
+            model
+                .switches
+                .iter()
+                .find(|s| s.code == code)
+                .map(|s| SharedString::from(s.label.clone()))
+        });
+        self.switch_select.update(cx, |state, cx| {
+            state.set_items(switches, window, cx);
+            if let Some(current) = current {
+                state.set_selected_value(&current, window, cx);
+            } else {
+                state.set_selected_index(None, window, cx);
+            }
+        });
+    }
+
     pub fn select_key(&mut self, slot: Option<u8>, window: &mut Window, cx: &mut Context<Self>) {
         self.selected = slot;
+        self.sync_magnetic(window, cx);
         self.sync_target(window, cx);
         cx.notify();
     }
@@ -1336,7 +1819,8 @@ impl Workbench {
         let label = match (self.selected, &self.draft) {
             (Some(slot), Some(d)) => {
                 let value = self.binding(d, slot);
-                TARGETS
+                self.model()
+                    .targets()
                     .iter()
                     .find(|t| t.value == Some(value))
                     .map(|t| SharedString::from(t.label.clone()))
@@ -1488,7 +1972,26 @@ impl Workbench {
         if d.lighting.mode != 13 && d.lighting.rgb != [250, 255, 250] {
             self.last_rgb = d.lighting.rgb;
         }
-        let light = Light::decode(&d.lighting, self.last_rgb);
+        let model = self.model();
+        self.target.update(cx, |state, cx| {
+            state.set_items(
+                model
+                    .targets()
+                    .iter()
+                    .map(|t| SharedString::from(t.label.clone()))
+                    .collect(),
+                window,
+                cx,
+            )
+        });
+        let effects: Vec<SharedString> = EFFECTS
+            .iter()
+            .filter(|(id, _)| model.supports_effect(*id))
+            .map(|(_, name)| (*name).into())
+            .collect();
+        self.effect
+            .update(cx, |s, cx| s.set_items(effects, window, cx));
+        let light = Light::decode(&d.lighting, self.last_rgb, model);
         let effect = EFFECTS
             .iter()
             .find(|(m, _)| *m == light.mode)
@@ -1507,15 +2010,34 @@ impl Workbench {
         if let Some(o) = &d.onboard {
             set(&self.debounce, f32::from(o.debounce), window, cx);
             let t = &o.sleep;
-            for (e, v) in self.sleep.clone().iter().zip([
-                t.time_bt,
-                t.time_24,
-                t.deep_time_bt,
-                t.deep_time_24,
-            ]) {
-                set(e, f32::from(v / 60), window, cx);
+            for (i, (e, v)) in self
+                .sleep
+                .clone()
+                .iter()
+                .zip([t.time_bt, t.time_24, t.deep_time_bt, t.deep_time_24])
+                .enumerate()
+            {
+                let bounds = model
+                    .sleep_ranges
+                    .get(i)
+                    .copied()
+                    .flatten()
+                    .unwrap_or([0, 64800]);
+                e.update(cx, |state, cx| {
+                    let old = std::mem::replace(state, SliderState::new());
+                    *state = old
+                        .max(f32::from(bounds[1]))
+                        .min(f32::from(bounds[0]))
+                        .step(1.);
+                    state.set_value(f32::from(v), window, cx);
+                });
             }
         }
+        if let Some(side) = d.advanced.as_ref().and_then(|s| s.side_lighting.as_ref()) {
+            self.side_color
+                .update(cx, |state, cx| state.set_value(hsla(side.rgb), window, cx));
+        }
+        self.sync_magnetic(window, cx);
         self.sync_target(window, cx);
         let slot = self.macro_slot;
         self.open_macro(slot, cx);
@@ -1616,6 +2138,8 @@ pub fn first_line(e: &impl std::fmt::Display) -> SharedString {
 
 impl Render for Workbench {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.preview
+            .sync(self.page == Page::Lighting && window.is_window_active() && !cx.reduce_motion());
         let theme = cx.theme().clone();
         let surface = ui::Surface::of(cx);
         let pending = self.pending();
@@ -1624,11 +2148,15 @@ impl Render for Workbench {
         let reading = self.busy == Some(Busy::Reading);
         let dark = theme.is_dark();
 
-        let status = match (&self.link, &self.baseline) {
-            (_, Some(s)) => firmware_label(s.usb_revision),
-            (Link::Failed(_), None) => "Disconnected".into(),
-            _ if reading && self.progress.kind().is_some() => "Reading".into(),
-            _ => "Connecting".into(),
+        let status = if self.previewing {
+            "Offline preview".into()
+        } else {
+            match (&self.link, &self.baseline) {
+                (_, Some(s)) => firmware_label(s.usb_revision),
+                (Link::Failed(_), None) => "Disconnected".into(),
+                _ if reading && self.progress.kind().is_some() => "Reading".into(),
+                _ => "Connecting".into(),
+            }
         };
         let presence = self.presence.unwrap_or(device::Presence {
             usb: false,
@@ -1673,17 +2201,22 @@ impl Render for Workbench {
             .bg(surface.canvas)
             .header(div().h(px(4.)))
             .child(
-                SidebarMenu::new().children(Page::ALL.into_iter().map(|page| {
-                    SidebarMenuItem::new(page.title())
-                        .icon(page.icon())
-                        .active(self.page == page)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.features.testing = false;
-                            this.features.held.clear();
-                            this.page = page;
-                            cx.notify();
-                        }))
-                })),
+                SidebarMenu::new().children(
+                    Page::ALL
+                        .into_iter()
+                        .filter(|page| *page != Page::Magnetic || self.model().magnetic)
+                        .map(|page| {
+                            SidebarMenuItem::new(page.title())
+                                .icon(page.icon())
+                                .active(self.page == page)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.features.testing = false;
+                                    this.features.held.clear();
+                                    this.page = page;
+                                    cx.notify();
+                                }))
+                        }),
+                ),
             )
             .footer(
                 SidebarFooter::new().child(
@@ -1721,7 +2254,7 @@ impl Render for Workbench {
                                 .gap_0p5()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child("MonsGeek M1W")
+                                .child(format!("MonsGeek {}", self.model().name))
                                 .child(status)
                                 .when(kind.is_some() || battery.is_some(), |d| {
                                     d.child(
@@ -1838,7 +2371,7 @@ impl Render for Workbench {
 mod tests {
     use super::*;
     use gpui_kit::TestAppContext;
-    use monsgeek_linux::config::SleepTimers;
+    use monsgeek_linux::{config::SleepTimers, keys};
     use std::time::Duration;
 
     fn fixture() -> Snapshot {
@@ -1866,6 +2399,7 @@ mod tests {
         .encode()
         .unwrap();
         let s = Snapshot {
+            advanced: None,
             format_version: 2,
             device_id: monsgeek_linux::protocol::DEVICE_ID,
             usb_revision: 0x0108,
@@ -1912,6 +2446,324 @@ mod tests {
                 });
                 cx.run_until_parked();
             }
+        }
+    }
+
+    #[gpui::test]
+    fn actuation_editor_accepts_typed_precision_and_blocks_invalid_drafts(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        let model = monsgeek_linux::models::get(2247).unwrap();
+        let slot = model.key_slot(4).unwrap();
+        view.update_in(cx, |w, window, cx| {
+            w.loaded(model.example_snapshot(), window, cx);
+            w.page = Page::Magnetic;
+            w.select_key(Some(slot), window, cx);
+        });
+        cx.run_until_parked();
+        for (text, accepted) in [
+            ("1.25", true),
+            ("999", false),
+            ("1.234", false),
+            ("1.5", true),
+        ] {
+            view.update_in(cx, |w, window, cx| {
+                w.magnetic_inputs[&0].update(cx, |input, cx| {
+                    input.set_value(text, window, cx);
+                    cx.emit(InputEvent::Change);
+                });
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |w, _| {
+                assert_eq!(w.pending().is_ok(), accepted, "{text}");
+                if accepted {
+                    assert_eq!(
+                        w.draft
+                            .as_ref()
+                            .unwrap()
+                            .advanced
+                            .as_ref()
+                            .unwrap()
+                            .value(model, 0, slot),
+                        text.parse::<f32>().ok()
+                    );
+                }
+            });
+        }
+        view.update_in(cx, |w, window, cx| {
+            w.previewing = true;
+            w.toggle_travel(window, cx);
+            assert!(!w.features.live_travel);
+            w.capture_pictures(window, cx);
+            assert!(w.busy.is_none());
+            w.previewing = false;
+            w.features.calibrating = true;
+            w.reload(window, cx);
+            assert!(w.busy.is_none());
+        });
+    }
+
+    #[gpui::test]
+    fn every_catalog_model_renders_every_page_and_all_maps(cx: &mut TestAppContext) {
+        let (view, cx) = open(cx);
+        for model in monsgeek_linux::models::MODELS.iter() {
+            view.update_in(cx, |w, window, cx| {
+                w.loaded(model.example_snapshot(), window, cx);
+                w.previewing = true;
+            });
+            for page in Page::ALL {
+                view.update_in(cx, |w, window, cx| {
+                    w.page = page;
+                    w.select_key(Some(model.key_slot(4).unwrap()), window, cx);
+                    cx.notify();
+                });
+                cx.run_until_parked();
+            }
+            for (fn_layer, count) in [(false, model.base_maps()), (true, model.fn_maps())] {
+                for map in 0..count {
+                    view.update_in(cx, |w, window, cx| {
+                        w.page = Page::Keys;
+                        w.fn_layer = fn_layer;
+                        w.layer = map;
+                        w.sync_target(window, cx);
+                        cx.notify();
+                    });
+                    cx.run_until_parked();
+                }
+            }
+            view.update_in(cx, |w, _, _| {
+                assert!(!w.can_flash_firmware());
+                assert!(w.pending().unwrap().is_empty());
+            });
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the headless GPU renderer; writes interaction and motion frames to /tmp"]
+    fn model_interaction_screenshots() {
+        use gpui_kit::{
+            Keystroke,
+            component::{Theme, ThemeMode},
+            size,
+        };
+        let platform = gpui_kit::platform::current_platform(true);
+        let mut context = gpui::HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(crate::AppAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        context.update(gpui_kit::init);
+        context.update(crate::use_geist);
+        for state in [
+            "dks",
+            "dks-scroll",
+            "dks-tail",
+            "model-menu",
+            "calibration",
+            "frame-0",
+            "frame-1",
+            "frame-2",
+        ] {
+            let id = if state.starts_with("frame") {
+                2845
+            } else {
+                2247
+            };
+            let mut view = None;
+            let handle = context
+                .open_window(size(px(1240.), px(960.)), |window, cx| {
+                    Theme::change(
+                        if state == "model-menu" {
+                            ThemeMode::Light
+                        } else {
+                            ThemeMode::Dark
+                        },
+                        Some(window),
+                        cx,
+                    );
+                    let workbench = cx.new(|cx| {
+                        let model = monsgeek_linux::models::get(id).unwrap();
+                        let mut snapshot = model.example_snapshot();
+                        let slot = model.key_slot(4).unwrap();
+                        if state.starts_with("dks") {
+                            snapshot
+                                .advanced
+                                .as_mut()
+                                .unwrap()
+                                .set_mode(slot, 2, true)
+                                .unwrap();
+                        }
+                        if let Some(side) =
+                            snapshot.advanced.as_mut().unwrap().side_lighting.as_mut()
+                        {
+                            side.mode = 4;
+                        }
+                        let mut w = Workbench::build(window, cx);
+                        w.loaded(snapshot, window, cx);
+                        w.previewing = true;
+                        w.page = if state.starts_with("frame") {
+                            Page::Lighting
+                        } else if state == "model-menu" {
+                            Page::Models
+                        } else {
+                            Page::Magnetic
+                        };
+                        w.select_key(Some(slot), window, cx);
+                        w.preview.freeze_at(match state {
+                            "frame-0" => 0.2,
+                            "frame-1" => 0.8,
+                            _ => 1.5,
+                        });
+                        w
+                    });
+                    view = Some(workbench.clone());
+                    cx.new(|cx| gpui_kit::base::Root::new(workbench, window, cx))
+                })
+                .unwrap();
+            context.run_until_parked();
+            let view = view.unwrap();
+            context
+                .update_window(handle.into(), |_, window, cx| {
+                    if state == "model-menu" {
+                        let select = view.read(cx).model_select.clone();
+                        select.update(cx, |s, cx| s.focus(window, cx));
+                        window.dispatch_keystroke(Keystroke::parse("space").unwrap(), cx);
+                    } else if state == "calibration" {
+                        view.update(cx, |w, cx| w.confirm_calibration(window, cx));
+                    } else if matches!(state, "dks-scroll" | "dks-tail") {
+                        use gpui_kit::InputEvent;
+                        window.dispatch_event(
+                            gpui_kit::ScrollEvent {
+                                position: gpui_kit::point(px(900.), px(800.)),
+                                delta: gpui_kit::ScrollDelta::Pixels(gpui_kit::point(
+                                    px(0.),
+                                    px(if state == "dks-tail" { -1900. } else { -1000. }),
+                                )),
+                                ..Default::default()
+                            }
+                            .to_platform_input(),
+                            cx,
+                        );
+                    }
+                })
+                .unwrap();
+            context.advance_clock(Duration::from_millis(500));
+            context.run_until_parked();
+            context
+                .update_window(handle.into(), |_, window, cx| {
+                    let _ = window.draw(cx);
+                })
+                .unwrap();
+            context
+                .capture_screenshot(handle.into())
+                .unwrap()
+                .save(format!("/tmp/monsgeek-interaction-{state}.png"))
+                .unwrap();
+            if matches!(state, "calibration" | "model-menu") {
+                context
+                    .update_window(handle.into(), |_, window, cx| {
+                        window.dispatch_keystroke(Keystroke::parse("escape").unwrap(), cx);
+                    })
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the headless GPU renderer; writes model screenshots to /tmp"]
+    fn model_screenshots() {
+        use gpui_kit::{
+            component::{Theme, ThemeMode},
+            size,
+        };
+        let platform = gpui_kit::platform::current_platform(true);
+        let mut context = gpui::HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(crate::AppAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        context.update(gpui_kit::init);
+        context.update(crate::use_geist);
+        for (id, page, width, dark, selected, custom) in [
+            (983, Page::Lighting, 1240., true, false, false),
+            (969, Page::Lighting, 1240., false, false, false),
+            (1200, Page::Keys, 960., true, true, false),
+            (1215, Page::Keys, 960., false, true, false),
+            (2247, Page::Magnetic, 1240., true, true, false),
+            (2247, Page::Keys, 960., false, true, false),
+            (4211, Page::Lighting, 1240., true, false, true),
+            (4180, Page::Keys, 960., false, true, false),
+            (2845, Page::Lighting, 1240., true, false, false),
+            (3147, Page::Performance, 960., true, false, false),
+            (2247, Page::System, 960., false, false, false),
+            (983, Page::Models, 960., true, false, false),
+        ] {
+            let handle = context
+                .open_window(size(px(width), px(860.)), |window, cx| {
+                    Theme::change(
+                        if dark {
+                            ThemeMode::Dark
+                        } else {
+                            ThemeMode::Light
+                        },
+                        Some(window),
+                        cx,
+                    );
+                    let view = cx.new(|cx| {
+                        let model = monsgeek_linux::models::get(id).unwrap();
+                        let mut snapshot = model.example_snapshot();
+                        if custom {
+                            snapshot.lighting.mode = 13;
+                            snapshot.lighting.flags = 4 << 4;
+                            for (i, color) in snapshot
+                                .onboard
+                                .as_mut()
+                                .unwrap()
+                                .rgb
+                                .chunks_mut(3)
+                                .enumerate()
+                            {
+                                color.copy_from_slice(
+                                    &[[230, 90, 70], [50, 180, 160], [80, 110, 220]][i % 3],
+                                );
+                            }
+                        }
+                        let mut w = Workbench::build(window, cx);
+                        w.loaded(snapshot, window, cx);
+                        w.previewing = true;
+                        w.preview = crate::effects::Clock::new(false);
+                        w.page = page;
+                        w.preview_model = id;
+                        w.model_select.update(cx, |s, cx| {
+                            s.set_selected_value(
+                                &format!("{} (ID {})", model.name, id).into(),
+                                window,
+                                cx,
+                            )
+                        });
+                        if selected {
+                            w.select_key(Some(model.key_slot(4).unwrap()), window, cx);
+                        }
+                        w
+                    });
+                    cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+                })
+                .unwrap();
+            context.run_until_parked();
+            context.advance_clock(Duration::from_millis(500));
+            context.run_until_parked();
+            context
+                .update_window(handle.into(), |_, window, cx| {
+                    let _ = window.draw(cx);
+                })
+                .unwrap();
+            context
+                .capture_screenshot(handle.into())
+                .unwrap()
+                .save(format!(
+                    "/tmp/monsgeek-model-{id}-{}.png",
+                    page.title().to_ascii_lowercase().replace(' ', "-")
+                ))
+                .unwrap();
         }
     }
 

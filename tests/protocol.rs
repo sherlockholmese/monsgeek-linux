@@ -68,11 +68,13 @@ fn hid_feature_framing_preserves_first_and_last_page_bytes() {
 }
 
 #[test]
-fn identity_gate_rejects_other_models_and_echoed_requests() {
+fn identity_gate_accepts_catalog_models_and_rejects_unknown_ids_and_echoes() {
     let mut reply = [0; 64];
     reply[..5].copy_from_slice(&[0x8f, 0xd7, 3, 0, 0]);
     assert_eq!(identify(&reply).unwrap(), 983);
     reply[1..5].copy_from_slice(&1604u32.to_le_bytes()); // M1W HE
+    assert_eq!(identify(&reply).unwrap(), 1604);
+    reply[1..5].copy_from_slice(&9999u32.to_le_bytes());
     assert!(identify(&reply).is_err());
     assert!(identify(&packet(&[0x8f], 7)).is_err());
     reply[0] = 0;
@@ -93,6 +95,7 @@ fn lighting_reads_keep_raw_flags_and_rgb_for_undo() {
 fn restore_preserves_unknown_bindings_and_last_two_slots() {
     use monsgeek_linux::device::Snapshot;
     let current = Snapshot {
+        advanced: None,
         format_version: 1,
         device_id: 983,
         usb_revision: 264,

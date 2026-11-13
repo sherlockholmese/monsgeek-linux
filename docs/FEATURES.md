@@ -1,6 +1,6 @@
 # Profiles, testing, desktop integration and host remapping
 
-These additions extend the original M1W configurator. They do not replace its
+These features cover every supported catalog model; see [KEYBOARDS.md](KEYBOARDS.md). They do not replace its
 firmware. The optional host service changes input on Linux while it is running;
 onboard configuration still uses the existing identity, backup and readback gates.
 
@@ -12,8 +12,9 @@ the current draft, including unapplied edits. They live in
 JSON files. Duplicate creates another local profile; it never touches HID.
 
 Choose which groups to load: keys, macros, lighting, performance, keyboard options,
-and active layer. **Load for review** stages the selected groups, preserving all
-others. Firmware revisions must match. Load keys and macros together when saved
+and active layer. Performance includes magnetic settings/report rate/output mode;
+lighting includes side lighting, and options includes modern keyboard options. **Load for review** stages the selected groups, preserving all
+others. Model IDs and firmware revisions must match. Magnetic precision must also match when loading performance settings. Load keys and macros together when saved
 bindings depend on the profile's macro bodies.
 
 The **Changes** page highlights affected positions and shows before/after values,
@@ -46,6 +47,26 @@ The last command remains a preview. The existing explicit write flags and a new
 before-state path are required to apply. Profile paths from `profiles list` are
 opaque generated filenames; names are stored inside the files.
 
+## Model previews, actuation and lighting
+
+**Keyboard models** provides a searchable catalog and isolated previews. The board
+renderer uses each model's geometry, physical key labels, tall numpad/ISO keys,
+JIS usages and actual knob. Fn controls follow Windows/macOS map counts, and
+magnetic boards expose all four output planes for every profile.
+
+**Actuation** includes typed travel/dead-zone controls, rapid trigger, key modes,
+DKS stages and bindings, switch types, Snap pairing, live travel and explicit USB
+calibration. Unsupported controls are omitted. Preview data cannot reach hardware
+write, calibration, capture or firmware paths. See [USAGE.md](USAGE.md) for units
+and calibration limitations.
+
+Lighting choices, directions, palettes, picture count and side effects follow the
+model. The physical preview simulates moving effects using a shared pausable
+clock; it suspends when hidden/inactive, respects reduced motion, and leaves
+static pictures still. Reactive effects use simulated taps. Contact feedback is
+immediate for pointer/keyboard and releases in90ms without moving preview keys.
+Exact firmware LED timing and randomness are not established by the simulation.
+
 ## Keyboard tester
 
 Open **Keyboard tester → Start testing**. The focused capture panel displays key
@@ -62,10 +83,10 @@ from the window, so it does not attribute events to one particular physical boar
 
 ## Complete RGB backups
 
-**Backups → Back up all three pictures** requires a clean draft and confirmation
+**Backups → Back up all pictures** requires a clean draft and confirmation
 of its temporary selection changes. Choose a new destination. Before changing
 selection, the app saves a fresh recovery snapshot. It selects/readbacks each of
-the three pictures, attempts to restore the original lighting even if a read
+the model's three or five pictures, attempts to restore the original lighting even if a read
 fails, and saves a backup only after successful restoration.
 
 Open a backup with **Open picture backup**. To restore colours, select the desired
@@ -202,6 +223,6 @@ draft staging, rendering and tester focus cleanup. Headless screenshots cover
 light/dark, narrow supported windows, long names, dialogs and error states.
 
 Physical evdev/uinput capture, notifications/tray delivery, desktop focus providers,
-login startup and the three-picture capture flow still need user-session/hardware
+login startup and the model-specific picture capture flow still need user-session/hardware
 validation. No input devices, access rules, autostart entries or keyboard firmware
 were changed while implementing these features.

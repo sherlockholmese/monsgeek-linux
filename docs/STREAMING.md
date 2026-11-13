@@ -10,8 +10,10 @@ recovered**; these features are not implemented or validated on Linux.
 The exact ID983 `lightLayout:ct` contains21 effects: basic modes1..19 including
 custom picture13, plus screen21 and audio22. It does not expose shared-table
 music20, train23, fireworks24 or user-color66. Off0 exists in the driver table.
-Picture UI offers three slots, but the inherited picture writer always selects0;
-independent firmware storage for three slots remains unresolved.
+Picture UI offers three slots. The original inherited writer selects0, while
+this implementation selects, captures and restores each picture explicitly.
+Independent picture storage and macro preservation later passed ID983 readback
+tests; see [VALIDATION.md](VALIDATION.md). This does not resolve streaming.
 
 Audio UI options `upright`, `separate`, `intersect` map to option indices0..2,
 with RGB/dazzle and brightness0..4. Screen brightness0..4. These are **effect IDs**

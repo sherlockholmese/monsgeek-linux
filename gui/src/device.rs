@@ -1,15 +1,28 @@
 //! Blocking device work. Every call opens, identifies and locks the keyboard,
 //! so the GUI never holds the configuration node between operations.
 use std::{
+    ffi::{CStr, CString},
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
 };
+
+static TARGET: OnceLock<CString> = OnceLock::new();
+
+pub fn select_path(path: &str) -> Result<()> {
+    let path = CString::new(path).context("Invalid device path")?;
+    anyhow::ensure!(TARGET.set(path).is_ok(), "Device path was already selected");
+    Ok(())
+}
+
+fn target() -> Option<&'static CStr> {
+    TARGET.get().map(|p| p.as_c_str())
+}
 
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -21,7 +34,29 @@ use monsgeek_linux::{
 
 fn open() -> Result<Keyboard> {
     let api = HidApi::new().context("Cannot enumerate HID devices")?;
-    Keyboard::open(&api, None)
+    Keyboard::open(&api, target())
+}
+
+pub fn calibrate(start: bool, model_id: u32) -> Result<PathBuf> {
+    let keyboard = open()?;
+    anyhow::ensure!(
+        keyboard.model().id == model_id,
+        "A different keyboard is connected"
+    );
+    let ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
+    let before = state_dir()?.join(format!("calibration-before-{ms}.json"));
+    transaction::save_new(&before, &keyboard.snapshot()?)?;
+    keyboard.calibrate(start)?;
+    Ok(before)
+}
+
+pub fn travel(model_id: u32) -> Result<Vec<f32>> {
+    let keyboard = open()?;
+    anyhow::ensure!(
+        keyboard.model().id == model_id,
+        "A different keyboard is connected"
+    );
+    keyboard.travel()
 }
 
 /// Live state of a full read, shared with the UI thread.
@@ -29,6 +64,8 @@ fn open() -> Result<Keyboard> {
 pub struct ReadProgress {
     /// Exchanges done, against `SNAPSHOT_EXCHANGES`.
     pub done: Arc<AtomicUsize>,
+    pub total: Arc<AtomicUsize>,
+    pub phase: Arc<Mutex<String>>,
     /// Transport being opened, then the transport of the identified keyboard.
     pub kind: Arc<Mutex<Option<Kind>>>,
 }
@@ -44,11 +81,15 @@ pub fn read(progress: ReadProgress) -> Result<(Snapshot, Kind)> {
     progress.done.store(0, Ordering::Relaxed);
     *progress.kind.lock().unwrap_or_else(|e| e.into_inner()) = None;
     let api = HidApi::new().context("Cannot enumerate HID devices")?;
-    let mut keyboard = Keyboard::open_reporting(&api, None, None, |kind| {
+    let mut keyboard = Keyboard::open_reporting(&api, target(), None, |kind| {
         *progress.kind.lock().unwrap_or_else(|e| e.into_inner()) = Some(kind);
     })?;
     keyboard.count_exchanges(progress.done.clone());
-    Ok((keyboard.snapshot()?, keyboard.kind()))
+    let snapshot = keyboard.snapshot_reporting(|label, total| {
+        progress.total.store(total, Ordering::Relaxed);
+        *progress.phase.lock().unwrap_or_else(|e| e.into_inner()) = label.into();
+    })?;
+    Ok((snapshot, keyboard.kind()))
 }
 
 /// What the background poll sees.
@@ -69,6 +110,32 @@ impl Presence {
 
 pub fn presence() -> Result<Presence> {
     let api = HidApi::new().context("Cannot enumerate HID devices")?;
+    if let Some(path) = target() {
+        let kind = api
+            .device_list()
+            .find(|info| info.path() == path)
+            .and_then(transport::kind_of);
+        return Ok(match kind {
+            Some(Kind::Usb) => Presence {
+                usb: true,
+                wireless: None,
+            },
+            Some(kind) => Presence {
+                usb: false,
+                wireless: Some((
+                    kind,
+                    Keyboard::open(&api, Some(path))
+                        .and_then(|k| k.battery())
+                        .ok()
+                        .flatten(),
+                )),
+            },
+            None => Presence {
+                usb: false,
+                wireless: None,
+            },
+        });
+    }
     let usb = api.device_list().any(transport::usb_candidate);
     Ok(Presence {
         usb,
@@ -97,7 +164,7 @@ pub fn flash_firmware(
         &mut api,
         &image,
         &image.info().sha256,
-        None,
+        target(),
         &before,
         Some(&baseline),
         |progress| {
@@ -131,7 +198,7 @@ pub fn load(path: &Path) -> Result<Snapshot> {
         // Before-state records wrap the snapshot.
         anyhow::Ok(serde_json::from_slice::<BeforeState>(&fs::read(path)?)?.snapshot)
     })
-    .context("Not an M1W snapshot")?;
+    .context("Not a supported keyboard snapshot")?;
     snapshot.validate()?;
     Ok(snapshot)
 }

@@ -19,15 +19,23 @@ impl Backup {
         self.snapshot.validate()?;
         ensure!(
             self.format_version == 1
-                && self.pictures.len() == 3
+                && self.pictures.len() == usize::from(self.snapshot.model()?.picture_count())
                 && self.pictures.iter().all(|p| p.len() == 384),
-            "Invalid three-picture backup"
+            "Invalid picture backup dimensions for this model"
         );
         Ok(())
     }
     pub fn picture_draft(&self, current: &Snapshot, picture: u8) -> Result<Snapshot> {
         self.validate()?;
-        ensure!(picture < 3, "Picture must be 0..2");
+        current.validate()?;
+        ensure!(
+            current.device_id == self.snapshot.device_id,
+            "Picture backup keyboard model differs"
+        );
+        ensure!(
+            picture < self.snapshot.model()?.picture_count(),
+            "Picture is out of range for this model"
+        );
         ensure!(
             current.usb_revision == self.snapshot.usb_revision,
             "Picture backup firmware revision differs"
@@ -55,7 +63,7 @@ pub fn capture(keyboard: &Keyboard, destination: &Path, journal: &Path) -> Resul
     let original = snapshot.lighting.clone();
     let capture = (|| -> Result<Vec<Vec<u8>>> {
         let mut pictures = Vec::new();
-        for picture in 0..3 {
+        for picture in 0..keyboard.model().picture_count() {
             let settings = Lighting {
                 mode: 13,
                 wire_speed: original.wire_speed,

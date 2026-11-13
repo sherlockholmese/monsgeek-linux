@@ -251,3 +251,92 @@ fn firmware_preview_and_flash_gates_stay_offline() {
     }
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn modern_models_preview_native_packets_and_infer_snapshot_identity() {
+    use monsgeek_linux::models;
+    let dir = std::env::temp_dir().join(format!("monsgeek-model-cli-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let model = models::get(2247).unwrap();
+    let snapshot = model.example_snapshot();
+    let path = dir.join("snapshot.json");
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let out = run(&[
+        "--device",
+        "/no/such/hid",
+        "option",
+        "--snapshot",
+        path.to_str().unwrap(),
+        "--name",
+        "wasd-swap",
+        "--enabled",
+        "true",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["device_id"], 2247);
+    assert_eq!(
+        v["change"]["change"]["bytes"],
+        serde_json::json!([0, 0, 0, 1])
+    );
+    assert!(
+        v["packet_hex"]
+            .as_str()
+            .unwrap()
+            .starts_with("09 00 00 00 00 01")
+    );
+    let out = run(&[
+        "magnetic",
+        "--snapshot",
+        path.to_str().unwrap(),
+        "--from",
+        "a",
+        "--setting",
+        "actuation",
+        "--value",
+        "1.5",
+    ]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["device_id"], 2247);
+    assert_eq!(v["changes"].as_array().unwrap().len(), 1);
+    for name in ["win-lock", "led-off", "keyboard-lock", "power-save"] {
+        let out = run(&[
+            "option",
+            "--snapshot",
+            path.to_str().unwrap(),
+            "--name",
+            name,
+            "--enabled",
+            "true",
+        ]);
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not a named option"));
+    }
+    assert!(
+        !run(&[
+            "--model",
+            "983",
+            "magnetic",
+            "--snapshot",
+            path.to_str().unwrap(),
+            "--from",
+            "a",
+            "--setting",
+            "actuation",
+            "--value",
+            "1.5"
+        ])
+        .status
+        .success()
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

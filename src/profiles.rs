@@ -57,6 +57,10 @@ impl Profile {
         Self::new(self.name.clone(), self.snapshot.clone())?;
         current.validate()?;
         ensure!(
+            current.device_id == self.snapshot.device_id,
+            "Profile keyboard model differs from keyboard"
+        );
+        ensure!(
             current.usb_revision == self.snapshot.usb_revision,
             "Profile firmware revision differs from keyboard"
         );
@@ -92,6 +96,24 @@ impl Profile {
             if selected.options {
                 to.options = from.options;
                 to.auto_os = from.auto_os;
+            }
+        }
+        if let (Some(to), Some(from)) = (&mut draft.advanced, &self.snapshot.advanced) {
+            if selected.lighting {
+                to.side_lighting = from.side_lighting.clone();
+            }
+            if selected.performance {
+                ensure!(
+                    from.magnetic.is_empty() || to.units_per_mm == from.units_per_mm,
+                    "Profile magnetic precision differs from keyboard"
+                );
+                to.report_rate = from.report_rate;
+                to.magnetic = from.magnetic.clone();
+                to.magnetic_mode = from.magnetic_mode;
+                to.output_mode = from.output_mode;
+            }
+            if selected.options {
+                to.options = from.options;
             }
         }
         let changes = current.restore_changes(&draft)?;

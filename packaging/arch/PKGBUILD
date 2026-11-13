@@ -7,7 +7,7 @@ pkgbase=monsgeek-linux
 pkgname=(monsgeek-linux monsgeek-linux-gui)
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Userspace configurator for the original MonsGeek M1W keyboard'
+pkgdesc='Userspace configurator for MonsGeek keyboards'
 arch=('x86_64' 'aarch64')
 license=('MIT')
 makedepends=('cargo' 'pkgconf')
@@ -52,7 +52,7 @@ check() {
 }
 
 package_monsgeek-linux() {
-  pkgdesc='Configurator for the original MonsGeek M1W keyboard: CLI and device access rule'
+  pkgdesc='Configurator for MonsGeek keyboards: CLI and device access rule'
   depends=('gcc-libs' 'glibc' 'systemd-libs')
   install=monsgeek-linux.install
 
@@ -66,7 +66,7 @@ package_monsgeek-linux() {
 }
 
 package_monsgeek-linux-gui() {
-  pkgdesc='Graphical configurator for the original MonsGeek M1W keyboard'
+  pkgdesc='Graphical configurator for MonsGeek keyboards'
   license=('MIT' 'OFL-1.1')
   depends=(
     "monsgeek-linux=$pkgver-$pkgrel"

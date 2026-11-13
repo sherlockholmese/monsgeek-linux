@@ -71,6 +71,16 @@ pub fn usage_name(usage: u8) -> Option<&'static str> {
         99 => "Num .",
         100 => "ISO \\",
         101 => "Menu",
+        135 => "Ro",
+        136 => "Kana",
+        137 => "Yen",
+        138 => "Convert",
+        139 => "NonConvert",
+        144 => "Hangul",
+        145 => "Hanja",
+        146 => "Katakana",
+        147 => "Hiragana",
+        148 => "Zenkaku/Hankaku",
         104..=115 => F13[usize::from(usage - 104)],
         224 => "Left Ctrl",
         225 => "Left Shift",
@@ -94,6 +104,17 @@ pub fn usage_legend(usage: u8) -> String {
         75 => "PgUp".into(),
         76 => "Del".into(),
         78 => "PgDn".into(),
+        83 => "Num".into(),
+        84 => "/".into(),
+        85 => "*".into(),
+        86 => "−".into(),
+        87 => "+".into(),
+        88 => "Enter".into(),
+        89..=97 => format!("{}", usage - 88),
+        98 => "0".into(),
+        99 => ".".into(),
+        138 => "Conv".into(),
+        139 => "NConv".into(),
         79 => "→".into(),
         80 => "←".into(),
         81 => "↓".into(),
@@ -231,6 +252,7 @@ pub static TARGETS: LazyLock<Vec<Target>> = LazyLock::new(|| {
     ];
     let keys = (4u8..=101)
         .chain(104..=115)
+        .chain(135..=148)
         .chain(224..=231)
         .filter_map(|u| usage_name(u).map(|n| (u, n)));
     for (u, n) in keys {
@@ -314,7 +336,7 @@ pub fn split_combo(value: [u8; 4]) -> Option<(Vec<u8>, u8)> {
         .then(|| (mods.to_vec(), key))
 }
 
-pub const EFFECTS: [(u8, &str); 20] = [
+pub const EFFECTS: [(u8, &str); 23] = [
     (0, "Off"),
     (1, "Static"),
     (2, "Breathing"),
@@ -335,6 +357,9 @@ pub const EFFECTS: [(u8, &str); 20] = [
     (17, "Rain down"),
     (18, "Meteor"),
     (19, "Reactive off"),
+    (23, "Train"),
+    (24, "Fireworks"),
+    (25, "User color"),
 ];
 
 /// Number of option values an effect accepts (directions or pictures).
@@ -366,6 +391,7 @@ pub struct Cap {
     pub x: f32,
     pub y: f32,
     pub w: f32,
+    pub h: f32,
 }
 
 pub const KNOB_PRESS: u8 = 6;
@@ -495,6 +521,7 @@ pub static LAYOUT: LazyLock<Vec<Cap>> = LazyLock::new(|| {
                     x,
                     y,
                     w,
+                    h: 1.,
                 });
             }
             x += w;

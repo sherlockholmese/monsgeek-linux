@@ -2,7 +2,7 @@
 name = "monsgeek-gui"
 version = "0.1.0"
 edition = "2024"
-description = "Native GPUI configurator for the original MonsGeek M1W"
+description = "Native Linux configurator for MonsGeek keyboards"
 license = "MIT"
 
 [dependencies]

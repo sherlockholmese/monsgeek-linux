@@ -6,6 +6,63 @@ not a mocked HID transport. They compare complete exported state after each
 change and explicit undo. An export includes the selected RGB picture, not all
 inactive pictures. Physical behavior and unplug/replug persistence are unproved.
 
+## Catalog coverage and animation pass (2026-11-14)
+
+Support now covers the 52 model IDs listed in [KEYBOARDS.md](KEYBOARDS.md).
+These additions were validated offline. No physical keyboard was configured,
+calibrated or flashed in this pass. Earlier ID983 hardware records below are
+historical evidence for that unit only.
+
+Executed checks:
+
+- `cargo test --workspace --offline`:75 passed (19 GUI,13 library,6 CLI,7 codec,
+  15 feature,9 model,6 protocol). Six GPU screenshot tests are ignored by default.
+- `cargo clippy --workspace --all-targets --offline -- -D warnings` and
+  `cargo fmt --all --check`: clean.
+- `cargo build --workspace --release --offline`: CLI and native GUI built.
+- `udevadm verify udev/70-monsgeek-m1w.rules`: success; rule not installed.
+- Arch PKGBUILD shell syntax and `git diff --check`: clean.
+- Catalog regeneration from retained vendor files: byte-for-byte match with
+  `docs/models.json`; no vendor JS execution.
+
+The model regression suite verifies all 52 identities, matrix dimensions and
+mapped physical keys, snapshot validation, complete last maps/slots, Mac Fn
+defaults, family-specific packet fields,3/5 picture counts, DKS transposition,
+magnetic edits/precision, cross-model snapshot/profile/picture/undo rejection,
+model firmware prefix/wide headers and numbered feature reports. CLI tests use
+an impossible HID path to prove modern option and magnetic previews stay offline
+and infer their snapshot model. Missing advanced fields, unrepresentable travel
+and magnetic-precision mismatches are refused.
+
+The GUI test renders every page and every base/Fn/output map for every model.
+Input tests verify typed actuation values, invalid-value blocking, preview
+hardware guards, native pointer/Enter/Space activation, held-contact feedback,
+fixed bounds and focus-loss cleanup. Animation tests sample every advertised
+non-streaming simulated effect over time at different speeds across all 52
+layouts, check finite colors/intensities, static frames, side effect IDs,
+brightness scaling, pause/resume and reduced-motion/inactive suspension.
+
+Two GPU tests were run explicitly with Mesa llvmpipe:
+
+```sh
+XDG_CONFIG_HOME=/tmp/monsgeek-model-qa/config \
+XDG_STATE_HOME=/tmp/monsgeek-model-qa/state \
+XDG_CACHE_HOME=/tmp/monsgeek-model-qa/cache \
+VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+cargo test -p monsgeek-gui --offline model_ -- --ignored --nocapture
+```
+
+They produced20 screenshots under `/tmp/monsgeek-model-*.png` and
+`/tmp/monsgeek-interaction-*.png`. Inspected states include960px and1240px native
+windows, light/dark, full-size and compact layouts, ISO/JIS, selected keys,
+five-picture painting, side lighting, model picker open, calibration confirmation,
+expanded/scrolled DKS and multiple animation frames. Inspection caught and fixed
+a clipped JIS legend, misleading preview firmware text, per-key numeric clipping,
+a false default Snap partner and repeated headings. No center-dot separators
+remain in GUI copy. Preview motion remains an approximation of firmware timing;
+headless screenshots do not establish physical LED fidelity or desktop session
+behavior.
+
 ## Feature additions (2026-11-11)
 
 The profiles, review, tester, three-picture backup, desktop integration,

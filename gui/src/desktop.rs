@@ -36,7 +36,7 @@ impl ksni::Tray for Tray {
         use ksni::menu::*;
         let mut items = vec![
             StandardItem {
-                label: "Open MonsGeek M1W".into(),
+                label: "Open MonsGeek".into(),
                 activate: Box::new(|this: &mut Self| {
                     let _ = this.sender.send(Event::Open);
                 }),
@@ -102,7 +102,7 @@ impl Drop for Bridge {
 pub fn tray(profiles: Vec<(PathBuf, String)>) -> Result<Bridge> {
     let (sender, events) = mpsc::channel();
     let handle = Tray {
-        title: "MonsGeek M1W".into(),
+        title: "MonsGeek".into(),
         profiles,
         sender,
     }
@@ -111,7 +111,7 @@ pub fn tray(profiles: Vec<(PathBuf, String)>) -> Result<Bridge> {
 }
 pub fn notify(battery: u8) -> Result<()> {
     notify_rust::Notification::new()
-        .appname("MonsGeek M1W")
+        .appname("MonsGeek")
         .summary("Keyboard battery is low")
         .body(&format!(
             "{battery}% remaining. Connect the USB cable to charge."
@@ -153,7 +153,7 @@ pub fn set_autostart(enabled: bool, executable: &Path) -> Result<()> {
         .replace('%', "%%");
     std::fs::create_dir_all(path.parent().context("No autostart directory")?)?;
     let text = format!(
-        "[Desktop Entry]\nType=Application\nName=MonsGeek M1W\nExec=\"{escaped}\"\nIcon=input-keyboard\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
+        "[Desktop Entry]\nType=Application\nName=MonsGeek\nExec=\"{escaped}\"\nIcon=input-keyboard\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"
     );
     let tmp = path.with_extension("desktop.tmp");
     std::fs::write(&tmp, text)?;

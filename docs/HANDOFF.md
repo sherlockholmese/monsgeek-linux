@@ -1,26 +1,43 @@
-# Agent handoff: original mechanical M1W
+# Agent handoff: MonsGeek keyboard catalog
 
 ## Goal and current state
 
-The owner requested implementation in Rust covering original-M1W configuration
-from the macOS app, excluding native host components such as audio/screen
-streaming. This supersedes the earlier documentation-only pause. Earlier
-reversible setting validation used the connected keyboard. The current Bluetooth
-implementation pass is offline because hardware is unavailable. The owner
-subsequently authorized implementing experimental firmware updates.
-The updater is implemented offline; hardware flashing, destructive reset,
-installation, publishing and shipping have not been performed.
+The owner requested full implementation across the bundled MonsGeek catalog,
+model-specific previews/lighting, proper animations, polished native UI without
+center-dot separators, and documentation after implementation. The CLI and GUI
+now cover all 52 catalog IDs across YC500 and RY5088 (including YC3123) families.
+See [KEYBOARDS.md](KEYBOARDS.md) for the exact boundary and per-model dimensions.
 
-Read [STATUS.md](STATUS.md), [USAGE.md](USAGE.md), [VALIDATION.md](VALIDATION.md),
-then [PROTOCOL.md](PROTOCOL.md). Do not restart protocol discovery. The CLI now
-implements the documented onboard codecs, bounded macro editing, raw exports,
-undo and difference-only restore. `gui/` is a GPUI front end that stages edits
-in a draft snapshot and applies them through `src/transaction.rs`, shared with the CLI.
+Only original M1W ID983/revision0108 has prior physical round-trip evidence.
+Other support is vendor-source-derived and tested offline. New sensor calibration,
+firmware flashing and Bluetooth were not hardware-validated. Native streaming,
+screens and destructive/reset/recovery operations remain excluded. Do not turn
+catalog completeness or headless screenshots into hardware compatibility claims.
 
-The previously validated unit is ID983, revision0x0108, USB3151:4015 interface2, usageFFFF:0002.
-Never rely on VID/PID alone; other boards share them. `/dev/hidraw7` is only the
-observed path. This workspace has no Git repository: work is local, not committed
-or pushed. The udev rule was syntax-checked, not installed.
+The repository contains uncommitted implementation/documentation changes. Preserve
+them. Do not restart model discovery or substitute source defaults for owner
+backups. Read STATUS, USAGE, VALIDATION and PROTOCOL before new hardware work.
+No installation, device writes, calibration, flashing, commit or push was performed
+in this pass. The udev rule was verified, not installed.
+
+## Catalog implementation
+
+- `src/models.rs`, `docs/models.json`, `docs/tools/extract_models.py`: factual
+  IDs, class family, capabilities, concrete matrices, geometry, ranges and hashes.
+- `src/advanced.rs`: family-specific options/report-rate/side codecs, magnetic
+  arrays and typed edits, DKS transposition, precision/range checks and pairing.
+- `tests/models.rs`: all 52 defaults/geometries/maps, boundary slots, family
+  packets, picture counts, cross-model/precision guards and boot/report framing.
+- `gui/src/board.rs`, `effects.rs`: physical model rendering, native contact
+  controls and bounded release, deterministic main/side animation simulations.
+- `gui/src/app.rs`, `pages.rs`: model picker, isolated previews, typed actuation,
+  outputs, model controls, calibration/live travel and per-key review integration.
+- GUI accepts `--device /dev/hidrawN`; target is pinned per process. Both apps
+  default to USB, receiver, then Bluetooth. Device identity is rechecked on writes.
+
+M7W's Insert geometry maps to Home slot85 as a documented positional alias.
+Do not remove the caveat without a physical test. Main/side animation timing is a
+simulation; reactive preview taps are synthetic and are not global input capture.
 
 ## Ownership and interfaces
 
@@ -40,7 +57,7 @@ command still selects an onboard layer.
 - `src/config.rs`: typed/raw binding tuples, full source-slot lookup, semantic
   macro validation/encode/decode, macro/RGB pages, sleep timers.
 - `src/device.rs`: strict HID selection, held device-node advisory lock, queries,
-  raw page reads, format2 exports, inverse/difference generation, settling and
+  raw page reads, format3 exports, inverse/difference generation, settling and
   readback, macro/RGB preservation.
 - `src/main.rs`: offline preview and explicit apply gate, JSON imports/plans,
   exclusive0600 before-state files, stale-baseline/revision/picture guards.
@@ -59,7 +76,7 @@ command still selects an onboard layer.
    `--apply --allow-experimental-writes --before NEW_PATH`. Backups/inverses are
    validated and saved before sends. Multi-change writes are not atomic; failures
    stop, with no general rollback/retry guarantee.
-2. Four512-byte base/Fn maps are exported. Restore uses single-slot writes because
+2. Original M1W has four512-byte base/Fn maps. Other models use catalog dimensions. Restore uses single-slot writes because
    the vendor's nine56-byte bulk packets cover only504 bytes. Never silently lose
    slots126/127 or replace unknown tuples with defaults.
    Revision0108 ignores the single-write layer field: a layer3 packet while
@@ -123,5 +140,5 @@ and compare all exported fields. Stop at any unexplained mismatch. Keep the
 before-state even after success; source defaults are not a recovery image.
 The firmware implementation and its offline checks are in [FIRMWARE.md](FIRMWARE.md).
 Actual hardware flashing was not requested during implementation.
-Do not install rules, flash/reset, create a Git repository or publish this work
+Do not install rules, flash/reset, commit, push or publish this work
 without the owner's separate request. Current CLI/JSON examples are in USAGE.

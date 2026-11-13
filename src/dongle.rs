@@ -12,15 +12,14 @@ use std::{thread::sleep, time::Duration};
 use anyhow::{Context, Result, ensure};
 use hidapi::{BusType, DeviceInfo, HidApi};
 
-use crate::protocol::VID;
-
 /// Receiver product IDs confirmed with this keyboard.
 pub const PIDS: [u16; 1] = [0x4011];
 
 pub fn candidate(info: &DeviceInfo) -> bool {
-    info.vendor_id() == VID
-        && PIDS.contains(&info.product_id())
+    crate::models::RECEIVERS.contains(&[info.vendor_id(), info.product_id()])
         && matches!(info.bus_type(), BusType::Usb)
+        && info.usage_page() == 0xffff
+        && info.usage() == 2
         && info.interface_number() == 2
 }
 
@@ -51,7 +50,12 @@ pub fn decode_status(payload: &[u8]) -> Result<Link> {
 
 /// Query the first connected receiver. `Ok(None)` means no receiver is plugged in.
 pub fn status(api: &HidApi) -> Result<Option<Link>> {
-    let Some(info) = api.device_list().find(|d| candidate(d)) else {
+    let candidates: Vec<_> = api.device_list().filter(|d| candidate(d)).collect();
+    ensure!(
+        candidates.len() <= 1,
+        "multiple receivers; select --device /dev/hidrawN"
+    );
+    let Some(info) = candidates.first() else {
         return Ok(None);
     };
     // Never interleave with a configuration session on the same receiver.
@@ -60,6 +64,8 @@ pub fn status(api: &HidApi) -> Result<Option<Link>> {
         .open_device(api)
         .context("Cannot open the 2.4 GHz receiver; see README udev permissions")?;
     let mut wire = [0u8; 65];
+    let feature = crate::transport::feature_report(&device)?;
+    wire[0] = feature.id;
     wire[1] = 0xf7;
     sleep(Duration::from_millis(10));
     device
@@ -67,10 +73,15 @@ pub fn status(api: &HidApi) -> Result<Option<Link>> {
         .context("Receiver status request failed")?;
     sleep(Duration::from_millis(20));
     let mut reply = [0u8; 65];
+    reply[0] = feature.id;
     let n = device
         .get_feature_report(&mut reply)
         .context("Receiver status read failed")?;
-    decode_status(&reply[1..n.max(1)]).map(Some)
+    decode_status(&crate::transport::decode_feature_report(
+        &reply[..n],
+        feature,
+    )?)
+    .map(Some)
 }
 
 #[cfg(test)]

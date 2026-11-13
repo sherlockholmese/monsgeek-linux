@@ -3,10 +3,10 @@ use clap::{Parser, Subcommand};
 use hidapi::HidApi;
 use monsgeek_linux::{
     access,
-    config::{Binding, Macro, SleepTimers, source_slot},
+    config::{Binding, Macro, SleepTimers},
     device::{Keyboard, Snapshot},
     firmware::{self, Image, Progress},
-    protocol::{self, Change, Lighting},
+    protocol::{Change, Lighting},
     transaction::{self, BeforeState, picture},
     transport::{self, Kind},
 };
@@ -15,11 +15,14 @@ use std::{ffi::CString, fs, path::PathBuf};
 #[derive(Parser)]
 #[command(
     version,
-    about = "Original M1W configurator. Bluetooth is experimental. Changes preview unless --apply is given."
+    about = "MonsGeek keyboard configurator. Bluetooth is experimental. Changes preview unless --apply is given."
 )]
 struct Args {
     #[arg(long, global = true)]
     device: Option<String>,
+    /// Model name or numeric ID for offline previews; verified against hardware on Apply.
+    #[arg(long, global = true)]
+    model: Option<String>,
     /// Restrict discovery to USB, receiver or experimental Bluetooth.
     #[arg(long, global = true, value_enum)]
     transport: Option<Kind>,
@@ -36,6 +39,32 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List supported model IDs, protocol families and layouts without accessing HID.
+    Models,
+    /// Family-specific setting as JSON (report rate, options, side lighting, magnetic arrays).
+    Advanced {
+        change: String,
+    },
+    /// Edit one magnetic key from a saved snapshot, preserving every other key.
+    Magnetic {
+        #[arg(long)]
+        snapshot: PathBuf,
+        #[arg(long)]
+        from: String,
+        #[arg(long, value_parser = ["actuation", "release", "rapid-press", "rapid-release", "bottom-dead-zone", "top-dead-zone", "dynamic-threshold", "tap-hold-ms", "switch-type", "mode", "rapid-trigger", "snap-pair"])]
+        setting: String,
+        #[arg(long)]
+        value: Option<f32>,
+        #[arg(long)]
+        partner: Option<String>,
+    },
+    /// Read 128 live travel values (modern mm, legacy normalized calibration ranges).
+    Travel,
+    /// Begin or finish switch calibration. Requires the normal apply/backup flags.
+    Calibrate {
+        #[arg(value_parser = ["start", "finish"])]
+        action: String,
+    },
     /// Manage named local profiles without accessing hardware.
     Profiles {
         #[command(subcommand)]
@@ -62,7 +91,7 @@ enum Command {
     },
     /// Experimental USB firmware update. Preview only unless --apply is given.
     Firmware {
-        /// Decompressed vendor firmwareFile.bin for original M1W (ID983).
+        /// Decompressed vendor firmware file for the selected --model.
         file: PathBuf,
         /// Expected SHA-256 from the offline preview. Mandatory when applying.
         #[arg(long)]
@@ -82,7 +111,7 @@ enum Command {
         file: PathBuf,
     },
     Profile {
-        #[arg(value_parser = clap::value_parser!(u8).range(0..=3))]
+        #[arg(value_parser = clap::value_parser!(u8).range(0..=19))]
         layer: u8,
     },
     Light {
@@ -310,19 +339,27 @@ fn local_command(args: &Args) -> Option<Result<()>> {
                 if !args.apply {
                     println!(
                         "{}",
-                        serde_json::json!({"preview_only":true,"pictures":3,"temporarily_changes_lighting":true,"output":file})
+                        serde_json::json!({"preview_only":true,"pictures":args.model.as_deref().map(monsgeek_linux::models::select).transpose()?.unwrap_or_else(monsgeek_linux::models::original).picture_count(),"temporarily_changes_lighting":true,"output":file})
                     );
                 } else {
                     let api = HidApi::new()?;
                     let path = args.device.as_deref().map(CString::new).transpose()?;
                     let keyboard =
                         Keyboard::open_with_transport(&api, path.as_deref(), args.transport)?;
+                    ensure!(
+                        args.model
+                            .as_deref()
+                            .map(monsgeek_linux::models::select)
+                            .transpose()?
+                            .is_none_or(|m| m.id == keyboard.model().id),
+                        "selected model differs from keyboard"
+                    );
                     pictures::capture(
                         &keyboard,
                         file,
                         args.before.as_ref().context("Before-state path required")?,
                     )?;
-                    println!("Saved all three pictures; original lighting restored");
+                    println!("Saved all model pictures; original lighting restored");
                 }
             }
             Command::Host { command } => {
@@ -424,8 +461,79 @@ fn load_snapshot(path: &PathBuf) -> Result<Snapshot> {
     Ok(s)
 }
 
-fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
+fn offline_changes(
+    cmd: &Command,
+    model: &monsgeek_linux::models::Model,
+) -> Result<Option<Vec<Change>>> {
     let change = match cmd {
+        Command::Magnetic {
+            snapshot,
+            from,
+            setting,
+            value,
+            partner,
+        } => {
+            let baseline = load_snapshot(snapshot)?;
+            let model = baseline.model()?;
+            let slot = model.source_slot(from)?;
+            let mut draft = baseline.clone();
+            let settings = draft
+                .advanced
+                .as_mut()
+                .context("snapshot lacks magnetic settings")?;
+            if setting == "snap-pair" {
+                settings.pair(
+                    slot,
+                    model.source_slot(partner.as_deref().context("--partner is required")?)?,
+                )?;
+            } else {
+                let value = value.context("--value is required")?;
+                match setting.as_str() {
+                    "mode" => {
+                        ensure!(
+                            value.fract() == 0. && (0.0..=5.0).contains(&value),
+                            "mode must be 0, 2, 3, 4 or 5"
+                        );
+                        let rapid = settings.magnetic.get(&7).context("mode not captured")?
+                            [usize::from(slot)]
+                            & 128
+                            != 0;
+                        settings.set_mode(slot, value as u8, rapid)?;
+                    }
+                    "rapid-trigger" => {
+                        ensure!(value == 0. || value == 1., "rapid-trigger must be 0 or 1");
+                        let modes = settings.magnetic.get_mut(&7).context("mode not captured")?;
+                        modes[usize::from(slot)] =
+                            (modes[usize::from(slot)] & 127) | if value == 1. { 128 } else { 0 };
+                    }
+                    _ => {
+                        let parameter = match setting.as_str() {
+                            "actuation" => 0,
+                            "release" => 1,
+                            "rapid-press" => 2,
+                            "rapid-release" => 3,
+                            "dynamic-threshold" => 4,
+                            "tap-hold-ms" => 5,
+                            "bottom-dead-zone" => 6,
+                            "top-dead-zone" => 251,
+                            "switch-type" => 252,
+                            _ => unreachable!(),
+                        };
+                        if parameter == 252 {
+                            ensure!(
+                                model.switches.iter().any(|s| f32::from(s.code) == value),
+                                "switch type unavailable on this model"
+                            );
+                        }
+                        settings.set_value(model, parameter, slot, value)?;
+                    }
+                }
+            }
+            return Ok(Some(baseline.restore_changes(&draft)?));
+        }
+        Command::Advanced { change } => Change::Advanced {
+            change: serde_json::from_str(change)?,
+        },
         Command::Profile { layer } => Change::Profile { layer: *layer },
         Command::Light {
             mode,
@@ -435,7 +543,15 @@ fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
             rainbow,
             color,
         } => Change::Lighting {
-            settings: Lighting::new(*mode, *speed, *brightness, *option, *rainbow, *color)?,
+            settings: Lighting::new_for(
+                model,
+                *mode,
+                *speed,
+                *brightness,
+                *option,
+                *rainbow,
+                *color,
+            )?,
         },
         Command::Remap {
             from,
@@ -445,7 +561,7 @@ fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
         } => Change::Remap {
             layer: *layer,
             fn_layer: *fn_layer,
-            slot: source_slot(from)?,
+            slot: model.source_slot(from)?,
             binding: [0, 0, *to, 0],
         },
         Command::Bind {
@@ -456,7 +572,7 @@ fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
         } => Change::Remap {
             layer: *layer,
             fn_layer: *fn_layer,
-            slot: source_slot(from)?,
+            slot: model.source_slot(from)?,
             binding: serde_json::from_str::<Binding>(binding)?.encode()?,
         },
         Command::Debounce { value } => Change::Debounce { value: *value },
@@ -480,6 +596,25 @@ fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
             enabled,
         } => {
             let s = load_snapshot(snapshot)?;
+            ensure!(
+                s.device_id == model.id,
+                "snapshot belongs to a different model"
+            );
+            if model.family == monsgeek_linux::models::Family::Ry5088 {
+                ensure!(
+                    name == "wasd-swap",
+                    "{name} is not a named option on this model; use `advanced` for its supported options"
+                );
+                let mut bytes = s
+                    .advanced
+                    .context("snapshot lacks advanced settings")?
+                    .options
+                    .context("snapshot lacks modern options")?;
+                bytes[3] = u8::from(*enabled);
+                return Ok(Some(vec![Change::Advanced {
+                    change: monsgeek_linux::advanced::Change::Options { bytes },
+                }]));
+            }
             let mut bytes = s.onboard.context("snapshot lacks raw options")?.options;
             let (index, mask) = match name.as_str() {
                 "win-lock" => (0, 1),
@@ -523,8 +658,8 @@ fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
             color,
         } => {
             let s = load_snapshot(snapshot)?;
+            let start = usize::from(s.model()?.source_slot(key)?) * 3;
             let mut data = s.onboard.context("snapshot lacks RGB")?.rgb;
-            let start = usize::from(source_slot(key)?) * 3;
             data[start..start + 3].copy_from_slice(color);
             Change::Rgb { data }
         }
@@ -547,11 +682,11 @@ fn offline_changes(cmd: &Command) -> Result<Option<Vec<Change>>> {
     Ok(Some(vec![change]))
 }
 
-fn preview(changes: &[Change]) -> Result<()> {
+fn preview(changes: &[Change], model: &monsgeek_linux::models::Model) -> Result<()> {
     let packets: Vec<_> = changes
         .iter()
         .map(|c| {
-            c.packets().map(|packets| {
+            c.packets_for(model).map(|packets| {
                 packets
                     .iter()
                     .map(|p| {
@@ -564,7 +699,7 @@ fn preview(changes: &[Change]) -> Result<()> {
             })
         })
         .collect::<Result<_>>()?;
-    let mut out = serde_json::json!({"device_id":protocol::DEVICE_ID,"changes":changes,"packets_hex":packets});
+    let mut out = serde_json::json!({"device_id":model.id,"model":model.name,"changes":changes,"packets_hex":packets});
     if changes.len() == 1 {
         out["change"] = serde_json::to_value(&changes[0])?;
         if packets[0].len() == 1 {
@@ -577,6 +712,42 @@ fn preview(changes: &[Change]) -> Result<()> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let selected_model = args
+        .model
+        .as_deref()
+        .map(monsgeek_linux::models::select)
+        .transpose()?;
+    let mut model = selected_model.unwrap_or_else(monsgeek_linux::models::original);
+    if matches!(args.command, Command::Models) {
+        for m in monsgeek_linux::models::MODELS.iter() {
+            println!(
+                "{}\t{}\t{:?}\t{:04x}:{:04x}{}",
+                m.id,
+                m.name,
+                m.family,
+                m.vid,
+                m.pid,
+                if m.magnetic { "\tmagnetic" } else { "" }
+            );
+        }
+        return Ok(());
+    }
+    // Baseline-backed offline commands carry their own model identity.
+    let source = match &args.command {
+        Command::Paint { snapshot, .. }
+        | Command::Option { snapshot, .. }
+        | Command::Magnetic { snapshot, .. } => Some(load_snapshot(snapshot)?),
+        Command::Restore { file, .. } => Some(load_snapshot(file)?),
+        Command::Undo { file } => Some(read_json::<BeforeState>(file)?.snapshot),
+        _ => None,
+    };
+    if let Some(source) = &source {
+        ensure!(
+            selected_model.is_none_or(|m| m.id == source.device_id),
+            "selected model differs from snapshot"
+        );
+        model = source.model()?;
+    }
     if matches!(
         args.command,
         Command::Profiles { .. }
@@ -590,24 +761,83 @@ fn main() -> Result<()> {
     if matches!(args.command, Command::Firmware { .. }) {
         return firmware_command(&args);
     }
-    let mut changes = offline_changes(&args.command)?;
+    if let Command::Calibrate { action } = &args.command {
+        if !args.apply {
+            println!(
+                "{}",
+                serde_json::json!({"preview_only": true,"action": action,"model": model.name,"warning":"Calibration changes sensor calibration; a configuration backup cannot restore the old calibration."})
+            );
+            return Ok(());
+        }
+        offer_rule();
+        let api = HidApi::new()?;
+        let path = args.device.as_deref().map(CString::new).transpose()?;
+        let keyboard = Keyboard::open_with_transport(&api, path.as_deref(), Some(Kind::Usb))?;
+        ensure!(
+            selected_model.is_none_or(|m| m.id == keyboard.model().id),
+            "selected model differs from keyboard"
+        );
+        ensure!(
+            keyboard.model().magnetic,
+            "calibration unavailable on this model"
+        );
+        transaction::save_new(
+            args.before.as_ref().context("--before is required")?,
+            &keyboard.snapshot()?,
+        )?;
+        keyboard.calibrate(action == "start")?;
+        println!(
+            "{}",
+            if action == "start" {
+                "Calibration started. Press every key fully, then run calibrate finish with a new before-state path."
+            } else {
+                "Calibration finish command sent. Inspect travel and test the keys."
+            }
+        );
+        return Ok(());
+    }
+    let mut changes = if args.apply && selected_model.is_none() && source.is_none() {
+        None
+    } else {
+        offline_changes(&args.command, model)?
+    };
     if let Some(changes) = &changes {
         for c in changes {
-            c.packets()?;
+            c.packets_for(model)?;
         }
-        preview(changes)?;
+        preview(changes, model)?;
         if !args.apply {
             eprintln!("Preview only. No HID device was opened and no command was sent.");
             return Ok(());
         }
     } else {
         ensure!(
-            !args.apply || matches!(args.command, Command::Restore { .. }),
+            !args.apply
+                || matches!(
+                    args.command,
+                    Command::Restore { .. }
+                        | Command::Profile { .. }
+                        | Command::Light { .. }
+                        | Command::Remap { .. }
+                        | Command::Bind { .. }
+                        | Command::Debounce { .. }
+                        | Command::Sleep { .. }
+                        | Command::AutoOs { .. }
+                        | Command::Macro { .. }
+                        | Command::Rgb { .. }
+                        | Command::Advanced { .. }
+                        | Command::Plan { .. }
+                ),
             "--apply requires a setting change or restore"
         );
     }
     if matches!(args.command, Command::Keys) {
-        println!("{}", include_str!("../docs/m1w-reference.json"));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(
+                &serde_json::json!({"device_id":model.id,"model":model.name,"matrices":model.matrices})
+            )?
+        );
         return Ok(());
     }
     if matches!(args.command, Command::InstallRule) {
@@ -618,7 +848,11 @@ fn main() -> Result<()> {
     }
     let api = HidApi::new().context("cannot enumerate HID devices")?;
     if matches!(args.command, Command::List) {
-        for d in api.device_list().filter(|d| d.vendor_id() == protocol::VID) {
+        for d in api.device_list().filter(|d| {
+            monsgeek_linux::models::MODELS
+                .iter()
+                .any(|m| m.vid == d.vendor_id())
+        }) {
             println!(
                 "{} {:04x}:{:04x} interface={} usage={:04x}:{:04x} {}{}",
                 d.path().to_string_lossy(),
@@ -629,7 +863,7 @@ fn main() -> Result<()> {
                 d.usage(),
                 d.product_string().unwrap_or(""),
                 match transport::kind_of(d) {
-                    Some(Kind::Usb) => " [M1W candidate; identity not checked]",
+                    Some(Kind::Usb) => " [keyboard candidate; identity not checked]",
                     Some(Kind::Dongle) => " [2.4 GHz receiver]",
                     Some(Kind::Bluetooth) =>
                         " [Bluetooth candidate, experimental; identity not checked]",
@@ -656,7 +890,30 @@ fn main() -> Result<()> {
                 e
             }
         })?;
+    ensure!(
+        selected_model.is_none_or(|m| m.id == keyboard.model().id),
+        "selected model differs from connected keyboard"
+    );
+    if let Some(source) = &source {
+        ensure!(
+            source.device_id == keyboard.model().id,
+            "snapshot keyboard model mismatch"
+        );
+    }
+    model = keyboard.model();
+    if args.apply {
+        changes = offline_changes(&args.command, model)?;
+    }
     match &args.command {
+        Command::Travel => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"device_id": model.id,"unit": if model.family == monsgeek_linux::models::Family::Ry5088 { "mm" } else { "normalized-calibration-range" }, "values": keyboard.travel()?})
+                )?
+            );
+            return Ok(());
+        }
         Command::Battery => {
             match keyboard.battery()? {
                 Some(battery) => println!("{battery}%"),
@@ -666,12 +923,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Command::Inspect => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &serde_json::json!({"device_id":protocol::DEVICE_ID,"active_layer":keyboard.active_layer()?,"lighting":keyboard.lighting()?,"debounce":keyboard.debounce()?,"sleep":keyboard.sleep_timers()?,"raw_options":keyboard.options()?,"auto_os":keyboard.auto_os()?})
-                )?
-            );
+            println!("{}", serde_json::to_string_pretty(&keyboard.snapshot()?)?);
             return Ok(());
         }
         Command::Snapshot { file } => {
@@ -711,7 +963,7 @@ fn main() -> Result<()> {
             }
             changes = Some(actual.restore_changes(&load_snapshot(file)?)?);
             if current.is_none() {
-                preview(changes.as_ref().unwrap())?;
+                preview(changes.as_ref().unwrap(), model)?;
             }
             if !args.apply {
                 eprintln!("Preview only; read current device state, no settings sent.");
@@ -731,8 +983,9 @@ fn main() -> Result<()> {
         transaction::check_undo(&read_json(file)?, &snapshot)?;
     }
     // A saved-baseline edit must never overwrite changes made since that baseline.
-    if let Command::Option { snapshot: base, .. } | Command::Paint { snapshot: base, .. } =
-        &args.command
+    if let Command::Option { snapshot: base, .. }
+    | Command::Paint { snapshot: base, .. }
+    | Command::Magnetic { snapshot: base, .. } = &args.command
     {
         let base = load_snapshot(base)?;
         let a = snapshot.onboard.as_ref().context("missing onboard state")?;
@@ -741,14 +994,18 @@ fn main() -> Result<()> {
             .as_ref()
             .context("missing baseline onboard state")?;
         ensure!(
-            snapshot.usb_revision == base.usb_revision,
+            snapshot.device_id == base.device_id && snapshot.usb_revision == base.usb_revision,
             "baseline revision mismatch"
         );
         ensure!(
             if matches!(args.command, Command::Paint { .. }) {
                 a.rgb == b.rgb && picture(&snapshot.lighting) == picture(&base.lighting)
+            } else if matches!(args.command, Command::Magnetic { .. }) {
+                snapshot.advanced == base.advanced
             } else {
                 a.options == b.options
+                    && snapshot.advanced.as_ref().and_then(|s| s.options)
+                        == base.advanced.as_ref().and_then(|s| s.options)
             },
             "baseline is stale; capture a new snapshot before editing"
         );
@@ -783,7 +1040,14 @@ fn firmware_command(args: &Args) -> Result<()> {
         args.transport.is_none_or(|kind| kind == Kind::Usb),
         "firmware updates require --transport usb"
     );
-    let image = Image::load(file)?;
+    let image = Image::load_for(
+        file,
+        args.model
+            .as_deref()
+            .map(monsgeek_linux::models::select)
+            .transpose()?
+            .unwrap_or_else(monsgeek_linux::models::original),
+    )?;
     if let Some(hash) = sha256 {
         image.check_sha256(hash)?;
     }
@@ -841,7 +1105,7 @@ fn firmware_command(args: &Args) -> Result<()> {
         },
     )?;
     println!(
-        "Bootloader confirmed completion; original M1W reidentified. Firmware {:04x} -> {:04x}. Configuration was not restored automatically.",
+        "Bootloader confirmed completion; target keyboard reidentified. Firmware {:04x} -> {:04x}. Configuration was not restored automatically.",
         outcome.old_revision, outcome.new_revision
     );
     Ok(())

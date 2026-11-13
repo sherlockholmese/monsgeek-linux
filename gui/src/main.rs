@@ -1,4 +1,4 @@
-//! Native GPUI configurator for the original MonsGeek M1W.
+//! Native GPUI configurator for MonsGeek keyboards.
 mod app;
 mod board;
 mod desktop;
@@ -122,6 +122,26 @@ fn use_geist(cx: &mut App) {
 }
 
 fn main() {
+    let args: Vec<_> = std::env::args().skip(1).collect();
+    match args.as_slice() {
+        [] => {}
+        [help] if matches!(help.as_str(), "--help" | "-h") => {
+            println!(
+                "MonsGeek configurator\n\nUsage: monsgeek-gui [--device /dev/hidrawN]\n\nUse monsgeek-linux list to find a configuration interface when several keyboards are connected."
+            );
+            return;
+        }
+        [flag, path] if flag == "--device" => {
+            if let Err(error) = device::select_path(path) {
+                eprintln!("{error:#}");
+                std::process::exit(2);
+            }
+        }
+        _ => {
+            eprintln!("Usage: monsgeek-gui [--device /dev/hidrawN]");
+            std::process::exit(2);
+        }
+    }
     log::start_session();
     log::install_panic_hook();
     gpui_kit::application()

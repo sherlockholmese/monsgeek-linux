@@ -1,56 +1,46 @@
-# Original MonsGeek M1W on Linux
+# MonsGeek keyboards on Linux
 
-An experimental Rust userspace configurator for the **original mechanical M1W**.
-Not the M1W HE, M1 V5, VIA models, or a firmware replacement. Ordinary typing
-already uses Linux's standard HID support; this program implements configuration.
+A Rust userspace configurator with a native GPUI app for **all 52 MonsGeek model
+IDs in the bundled v500.3.3 vendor catalog**, including mechanical, HE and TMR
+boards and ISO/JIS variants. Normal typing uses Linux HID support.
 
-**Implemented in Rust and exercised against the connected original M1W,
-ID983, revision0x0108.** Reversible setting tests save the original configuration,
-compare full readback, undo, and require exact restoration. Physical key behavior
-and power-cycle persistence are separate checks, not inferred from readback.
-
-Start with [the usage guide](docs/USAGE.md), [feature status](docs/STATUS.md) and
-[validation evidence](docs/VALIDATION.md). Protocol/source references are in
-[docs/README.md](docs/README.md). [Profiles, testing, desktop controls and optional
-Linux host remapping](docs/FEATURES.md) extend the configurator. Audio/screen
-streaming, system-wide macro recording and destructive reset remain excluded. Firmware updates are
-[implemented experimentally over USB](docs/FIRMWARE.md), without hardware validation.
+See the [exact keyboard coverage](docs/KEYBOARDS.md), [usage guide](docs/USAGE.md),
+[status](docs/STATUS.md) and [validation evidence](docs/VALIDATION.md). Support for
+other models is source-derived and tested offline. Earlier hardware round trips
+cover the original M1W ID983/revision0x0108 only; this does not establish physical
+behavior or power-cycle retention for all 52 entries. Unknown IDs are refused.
 
 ## Implemented
 
-- USB interface enumeration and strict identity check: `3151:4015`, interface 2,
-  usage `ffff:0002`, internal device ID **983**. The USB ID is shared with other
-  boards, so it is not sufficient by itself.
-- Read active layer and raw lighting settings.
-- Format2 configuration export: four base/Fn maps, lighting, layer, revision,
-  debounce, sleep timers, raw options, auto-OS setting, RGB and all50 raw macro
-  slots. This is not firmware or a disaster-recovery image. Format1 is still readable.
-- Base/Fn remapping, combos, consumer/media/system/mouse/pointer actions,
-  vendor/raw bindings, disabled keys, physical Fn and knob positions.
-- Macro compilation/read/write/clear, repeat counts, three playback binding
-  modes, keyboard/mouse events and signed movement; bounded validation.
-- Onboard effects0..19 including custom-picture selection, RGB import/export,
-  single-key color edits preserving all other slots.
-- Experimental USB firmware flashing from a local vendor image, with offline
-  preview, explicit flashing opt-in, configuration backup and progress.
-- Debounce, wireless sleep/deep-sleep timers, raw-preserving keyboard options
-  and automatic OS detection.
-- Offline previews, ordered JSON plans, difference-only restore, multi-change
-  undo, exclusive0600 before-state files, advisory device lock and readback checks.
+- Model identification, configuration-interface discovery and USB/receiver/
+  experimental Bluetooth framing, including numbered feature reports.
+- Model-specific keyboard layouts, base/Fn maps, magnetic output planes,
+  remapping, combos, media/system/mouse actions, knob positions and macros.
+- Advertised onboard lighting, animated main/side previews, model-specific
+  palettes/directions, per-key painting and three/five-picture backups.
+- HE/TMR actuation, rapid trigger, dynamic outputs, Snap pairs, dead zones,
+  switch selection, live travel and explicit USB calibration.
+- Model-specific report rates, debounce, available sleep timers and options.
+- Format3 snapshots, difference-only restore, selective profiles, readable
+  review, owner-only before-states, undo, stale-state checks and readback.
+- Experimental model-targeted USB firmware updates from local vendor files.
 
-Not implemented: host-native audio/screen streaming, system-wide macro
-recording or destructive reset.
+Catalog coverage does not include unrelated QMK/VIA models. Audio/screen streaming,
+keyboard-screen hardware, global macro recording, destructive reset, wireless
+flashing and already-booted firmware recovery remain excluded. Firmware flashing
+and sensor calibration have not been tested on hardware during this pass.
 
 ## Graphical configurator
 
 `gui/` is a native GPUI application (shadcn-style GPUI Kit components) covering
-the same onboard features: lighting effects and per-key custom pictures, base and
-Fn remapping on all four layers including the knob, combinations, media, mouse,
-layer and macro actions, macro recording and editing, debounce, wireless sleep,
-keyboard options, active layer, export/open and undo.
+the onboard features for the identified model, including magnetic actuation,
+model-specific base/Fn/output maps, lighting, macros, performance, keyboard options,
+backups and undo. **Keyboard models** provides isolated offline previews for all
+catalog entries. Use `monsgeek-gui --device /dev/hidrawN` to select one interface
+when several keyboards are connected.
 
 It also provides named profiles with selective loading, before/after change
-review, a focused keyboard tester, complete three-picture RGB backups, diagnostic
+review, a focused keyboard tester, complete three/five-picture RGB backups, diagnostic
 exports, low-battery notifications, tray controls, optional login startup, and an
 experimental Linux host remapper for tap-hold, tap dance, chords, application
 rules and launch actions. See [the feature guide](docs/FEATURES.md) for setup and
@@ -167,10 +157,16 @@ in decimal / `0x` hex. A bare `1` means **usage 1**, not the digit key, and is
 rejected; the digit 1 key is usage `30` (`0x1e`). Remapping identifies physical
 keys using the vendor's matrix, not their currently assigned values. `--fn-layer`
 targets the Fn mapping; this does not change the physical Fn key itself.
-Vendor layer indices are **0..3**, not assumed to be four independent hardware
-profiles. The relationship to the keyboard's Windows/macOS modes needs testing.
+Layer counts follow the model catalog. Magnetic base maps flatten profile/output
+as `profile * 4 + output`; Fn maps use the model's Windows/macOS counts. Examples
+without `--model` use original M1W defaults. Physical OS-switch behavior still
+needs per-model validation.
 
 ### Onboard lighting
+
+The table below describes original M1W defaults. Other models expose their own
+subset, directions and up to five pictures; some also expose Train23 and
+Fireworks24. Use the GUI or [catalog](docs/KEYBOARDS.md) for the actual model.
 
 | ID | Effect | ID | Effect |
 |---|---|---|---|
@@ -218,10 +214,9 @@ sudo install -m644 udev/70-monsgeek-m1w.rules /etc/udev/rules.d/70-monsgeek-m1w.
 sudo udevadm control --reload-rules
 ```
 
-This grants the active local login access to interface 2 on `3151:4015` (cable)
-and `3151:4011` (2.4 GHz receiver), plus the Bluetooth keyboard's single hidraw
-node; it does not make all HID devices world-writable. Boards sharing that ID may also match
-the permission rule; the program still checks internal ID 983 before configuring.
+This grants the active local login access to interface 2 on catalog USB and
+receiver IDs, plus matching Bluetooth keyboard nodes; it does not make all HID devices world-writable. Boards sharing that ID may also match
+the permission rule; the program still checks the internal ID against the 52-model allowlist before configuring.
 For experimental firmware updates, the rule also grants interface0 on the
 reference's shared boot-keyboard IDs. The updater requires the original USB port.
 

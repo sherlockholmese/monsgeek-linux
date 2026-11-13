@@ -37,6 +37,10 @@ use std::{
 use monsgeek_linux::keys;
 
 pub struct Features {
+    pub calibrating: bool,
+    pub live_travel: bool,
+    pub calibration_status: String,
+    pub travel: Vec<f32>,
     pub profiles: Vec<(PathBuf, Profile)>,
     pub profile_error: Option<String>,
     pub selection: Selection,
@@ -119,6 +123,10 @@ impl Features {
             }
         });
         Self {
+            calibrating: false,
+            live_travel: false,
+            calibration_status: String::new(),
+            travel: Vec::new(),
             profiles: profiles.unwrap_or_default(),
             profile_error: error,
             selection: Selection::default(),
@@ -382,7 +390,7 @@ impl Workbench {
                 _ => "Disconnected".into(),
             };
             tray.handle
-                .update(move |tray| tray.title = format!("MonsGeek M1W ({status})"));
+                .update(move |tray| tray.title = format!("MonsGeek ({status})"));
         }
     }
     pub fn export_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -420,7 +428,9 @@ impl Workbench {
         .detach();
     }
     pub fn capture_pictures(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.busy.is_some()
+        if self.previewing
+            || self.features.calibrating
+            || self.busy.is_some()
             || !self.pending().is_ok_and(|v| v.is_empty())
             || self.baseline.is_none()
         {
@@ -517,7 +527,7 @@ impl Workbench {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Open three-picture backup".into()),
+            prompt: Some("Open picture backup".into()),
         });
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(paths))) = prompt.await
@@ -694,7 +704,7 @@ fn profiles_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElemen
         .small()
         .icon(gpui_kit::assets::IconName::Plus)
         .label("Save profile")
-        .disabled(this.draft.is_none() || this.busy.is_some())
+        .disabled(this.draft.is_none() || this.busy.is_some() || this.previewing)
         .on_click(cx.listener(|this, _, window, cx| {
             if let Some(snapshot) = this.draft.clone() {
                 this.name_profile(snapshot, String::new(), window, cx)
@@ -709,6 +719,10 @@ fn profiles_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElemen
         .map(|(index, (_, profile))| {
             let load = profile.clone();
             let revision = profile.snapshot.usb_revision;
+            let same_model = this
+                .baseline
+                .as_ref()
+                .is_none_or(|b| b.device_id == profile.snapshot.device_id);
             h_flex()
                 .min_h(px(52.))
                 .py_2()
@@ -721,6 +735,17 @@ fn profiles_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElemen
                         .font_weight(gpui_kit::FontWeight::MEDIUM)
                         .child(profile.name.clone()),
                 )
+                .when(!same_model, |d| {
+                    d.child(
+                        div().text_sm().text_color(theme.muted_foreground).child(
+                            profile
+                                .snapshot
+                                .model()
+                                .map(|m| m.name.clone())
+                                .unwrap_or_else(|_| "Different model".into()),
+                        ),
+                    )
+                })
                 // Firmware only matters when it differs from the keyboard's.
                 .when(current.is_some_and(|c| c != revision), |d| {
                     d.child(
@@ -754,7 +779,9 @@ fn profiles_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElemen
                                 .outline()
                                 .small()
                                 .label("Load")
-                                .disabled(!this.editable())
+                                .disabled(
+                                    !this.editable() || !same_model || current != Some(revision),
+                                )
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     this.load_profile(load.clone(), window, cx)
                                 })),
@@ -837,8 +864,9 @@ fn review_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement 
     if !changed.is_empty() {
         parts.push(board(
             "review-board",
+            this.model(),
             |slot| Look {
-                legend: keys::slot_legend(slot).into(),
+                legend: this.model().slot_legend(slot).into(),
                 selected: changed.contains(&slot),
                 ..Default::default()
             },
@@ -900,12 +928,13 @@ fn tester_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement 
         .track_focus(&focus)
         .child(board(
             "tester-board",
+            this.model(),
             |slot| {
-                let usage = keys::default_binding(false, slot)[2];
+                let usage = this.model().default_binding(false, 0, slot)[2];
                 let held = this.features.held.contains(&usage);
                 let seen = this.features.seen.contains(&usage);
                 Look {
-                    legend: keys::slot_legend(slot).into(),
+                    legend: this.model().slot_legend(slot).into(),
                     pressed: held,
                     fill: if held {
                         Some(theme.primary)
@@ -1280,7 +1309,8 @@ fn host_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
 }
 
 pub fn picture_controls(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
-    let clean = this.baseline.is_some()
+    let clean = !this.previewing
+        && this.baseline.is_some()
         && this.busy.is_none()
         && this.pending().is_ok_and(|v| v.is_empty());
     let actions = h_flex()
@@ -1307,7 +1337,7 @@ pub fn picture_controls(this: &mut Workbench, cx: &mut Context<Workbench>) -> An
     if this.features.picture_backup.is_some() {
         parts.push(ui::section(
             "",
-            (0..3u8)
+            (0..this.model().picture_count())
                 .map(|picture| {
                     h_flex()
                         .min_h(px(52.))

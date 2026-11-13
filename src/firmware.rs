@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     device::{Keyboard, Snapshot, lock_node},
-    protocol::{self, Packet, packet},
+    protocol::{Packet, packet},
     transaction,
     transport::{self, Kind},
 };
@@ -68,23 +68,34 @@ impl Image {
     /// The host skips 64 KiB. No model/signature format is established in that
     /// prefix: do not claim that this parser authenticates the image's model.
     pub fn parse(bytes: &[u8]) -> Result<Self> {
+        Self::parse_for(bytes, crate::models::original())
+    }
+
+    pub fn parse_for(bytes: &[u8], model: &crate::models::Model) -> Result<Self> {
+        let prefix = model.firmware_prefix;
         ensure!(
-            bytes.len() > PREFIX_BYTES,
-            "vendor firmware file must exceed the 65536-byte prefix"
+            bytes.len() > prefix,
+            "vendor firmware file must exceed the {prefix}-byte prefix for {}",
+            model.name
         );
-        let payload = &bytes[PREFIX_BYTES..];
+        let payload = &bytes[prefix..];
+        let release = known_release(&format!("{:x}", Sha256::digest(bytes)));
+        ensure!(
+            release.as_ref().is_none_or(|r| r.device_id == model.id),
+            "known firmware image is for another keyboard model"
+        );
         ensure!(
             payload.len() <= MAX_PAYLOAD_BYTES,
             "firmware exceeds the 65535-block protocol limit"
         );
         Ok(Self {
             info: ImageInfo {
-                known_release: known_release(&format!("{:x}", Sha256::digest(bytes))),
+                known_release: release,
                 experimental: true,
-                target_device_id: protocol::DEVICE_ID,
+                target_device_id: model.id,
                 image_model_verified: false,
                 file_bytes: bytes.len(),
-                prefix_bytes: PREFIX_BYTES,
+                prefix_bytes: prefix,
                 payload_bytes: payload.len(),
                 blocks: payload.len().div_ceil(64) as u16,
                 payload_sum: payload.iter().map(|b| u32::from(*b)).sum(),
@@ -95,12 +106,16 @@ impl Image {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_for(path, crate::models::original())
+    }
+
+    pub fn load_for(path: &Path, model: &crate::models::Model) -> Result<Self> {
         let mut bytes = Vec::new();
         File::open(path)
             .with_context(|| format!("cannot open {}", path.display()))?
             .take((PREFIX_BYTES + MAX_PAYLOAD_BYTES + 1) as u64)
             .read_to_end(&mut bytes)?;
-        Self::parse(&bytes)
+        Self::parse_for(&bytes, model)
     }
 
     pub fn info(&self) -> &ImageInfo {
@@ -120,6 +135,15 @@ impl Image {
     }
 
     pub fn prepare_packet(&self) -> Packet {
+        if crate::models::get(self.info.target_device_id)
+            .expect("parsed model")
+            .firmware_wide
+        {
+            let mut header = [0; 12];
+            header[..2].copy_from_slice(&[0xba, 0xc0]);
+            header[8..12].copy_from_slice(&u32::from(self.info.blocks).to_le_bytes());
+            return packet(&header, 7);
+        }
         let mut header = [0; 8];
         header[..2].copy_from_slice(&[0xba, 0xc0]);
         header[2..4].copy_from_slice(&self.info.blocks.to_le_bytes());
@@ -131,6 +155,14 @@ impl Image {
         // ci.None: byte 7 is part of the 32-bit data sum, not a header checksum.
         let mut out = [0; 64];
         out[..2].copy_from_slice(&[0xba, 0xc2]);
+        if crate::models::get(self.info.target_device_id)
+            .expect("parsed model")
+            .firmware_wide
+        {
+            out[8..12].copy_from_slice(&u32::from(self.info.blocks).to_le_bytes());
+            out[12..16].copy_from_slice(&self.info.payload_sum.to_le_bytes());
+            return out;
+        }
         out[2..4].copy_from_slice(&self.info.blocks.to_le_bytes());
         out[4..8].copy_from_slice(&self.info.payload_sum.to_le_bytes());
         out[8..12].copy_from_slice(&(self.info.payload_bytes as u32).to_le_bytes());
@@ -197,7 +229,11 @@ fn transfer(
     wait(Duration::from_millis(100));
     let reply = io.receive().context("firmware completion reply failed")?;
     ensure!(
-        reply[4] == 0x55,
+        reply[if crate::models::get(image.info.target_device_id)?.firmware_wide {
+            2
+        } else {
+            4
+        }] == 0x55,
         "bootloader did not confirm firmware completion"
     );
     Ok(())
@@ -206,11 +242,13 @@ fn transfer(
 struct BootConnection {
     device: HidDevice,
     _lock: File,
+    feature: transport::FeatureReport,
 }
 
 impl BootIo for BootConnection {
     fn send(&mut self, packet: &Packet) -> Result<()> {
         let mut wire = [0; 65];
+        wire[0] = self.feature.id;
         wire[1..].copy_from_slice(packet);
         self.device
             .send_feature_report(&wire)
@@ -219,11 +257,12 @@ impl BootIo for BootConnection {
 
     fn receive(&mut self) -> Result<Packet> {
         let mut wire = [0; 65];
+        wire[0] = self.feature.id;
         let count = self
             .device
             .get_feature_report(&mut wire)
             .context("USB bootloader feature read failed")?;
-        protocol::decode_feature(&wire[..count])
+        transport::decode_feature_report(&wire[..count], self.feature)
     }
 }
 
@@ -355,6 +394,10 @@ pub fn flash(
     let info = candidates[0].clone();
     let port = usb_port(&info)?;
     let keyboard = Keyboard::open_with_transport(api, Some(info.path()), Some(Kind::Usb))?;
+    ensure!(
+        keyboard.model().id == image.info.target_device_id,
+        "firmware target differs from connected keyboard model"
+    );
     progress(Progress::BackingUp);
     let snapshot = keyboard.snapshot()?;
     if let Some(baseline) = baseline {
@@ -375,6 +418,7 @@ pub fn flash(
             .open_device(api)
             .context("cannot open bootloader; install the current access rule")?;
         let mut connection = BootConnection {
+            feature: transport::feature_report(&device)?,
             device,
             _lock: lock,
         };
@@ -387,6 +431,10 @@ pub fn flash(
         drop(keyboard);
         let normal = find_on_port(api, &port, false)?;
         let returned = Keyboard::open_with_transport(api, Some(normal.path()), Some(Kind::Usb))?;
+        ensure!(
+            returned.model().id == image.info.target_device_id,
+            "different keyboard identity after firmware update"
+        );
         let new_revision = returned.firmware_revision()?;
         Ok(Outcome {
             old_revision,

@@ -24,10 +24,7 @@ use std::{
 use anyhow::{Context, Result, bail, ensure};
 use hidapi::{BusType, DeviceInfo, HidApi, HidDevice};
 
-use crate::{
-    dongle,
-    protocol::{PID, Packet, VID},
-};
+use crate::{dongle, protocol::Packet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Kind {
@@ -57,8 +54,9 @@ impl fmt::Display for Kind {
 }
 
 pub fn usb_candidate(info: &DeviceInfo) -> bool {
-    info.vendor_id() == VID
-        && info.product_id() == PID
+    crate::models::MODELS
+        .iter()
+        .any(|m| m.vid == info.vendor_id() && m.pid == info.product_id())
         && matches!(info.bus_type(), BusType::Usb)
         && info.usage_page() == 0xffff
         && info.usage() == 2
@@ -67,7 +65,9 @@ pub fn usb_candidate(info: &DeviceInfo) -> bool {
 
 /// Vendor configuration collection of a MonsGeek Bluetooth LE keyboard.
 pub fn bluetooth_candidate(info: &DeviceInfo) -> bool {
-    info.vendor_id() == VID
+    crate::models::MODELS
+        .iter()
+        .any(|m| m.vid == info.vendor_id())
         && matches!(info.bus_type(), BusType::Bluetooth)
         && matches!(info.usage_page(), 0xff55 | 0xff66)
         && info.usage() == 0x0202
@@ -92,6 +92,100 @@ pub struct Reports {
     pub output_len: usize,
     pub input_id: u8,
     pub input_len: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeatureReport {
+    pub id: u8,
+    pub len: usize,
+}
+
+/// Feature report IDs belong to a descriptor, not a keyboard model or PID.
+pub fn parse_feature_report(descriptor: &[u8]) -> Result<FeatureReport> {
+    let (mut page, mut id, mut size, mut count) = (0u32, 0u8, 0usize, 0usize);
+    let mut stack = Vec::new();
+    let mut bits = BTreeMap::<u8, usize>::new();
+    let mut vendor = BTreeSet::new();
+    let mut i = 0;
+    while i < descriptor.len() {
+        let prefix = descriptor[i];
+        if prefix == 0xfe {
+            let len = usize::from(*descriptor.get(i + 1).context("truncated long HID item")?);
+            ensure!(i + 3 + len <= descriptor.len(), "truncated long HID item");
+            i += 3 + len;
+            continue;
+        }
+        let len = [0, 1, 2, 4][usize::from(prefix & 3)];
+        let data = descriptor
+            .get(i + 1..i + 1 + len)
+            .context("truncated HID descriptor")?;
+        let value = data
+            .iter()
+            .rev()
+            .fold(0u32, |v, b| (v << 8) | u32::from(*b));
+        match prefix & 0xfc {
+            0x04 => page = value,
+            0x74 => size = value as usize,
+            0x84 => {
+                ensure!((1..=255).contains(&value), "invalid report ID");
+                id = value as u8;
+            }
+            0x94 => count = value as usize,
+            0xa4 => stack.push((page, id, size, count)),
+            0xb4 => (page, id, size, count) = stack.pop().context("unmatched HID global pop")?,
+            0xb0 => {
+                let total = bits.entry(id).or_default();
+                *total = total
+                    .checked_add(
+                        size.checked_mul(count)
+                            .context("feature report too large")?,
+                    )
+                    .context("feature report too large")?;
+                ensure!(*total <= 4096 * 8, "feature report too large");
+                if page >= 0xff00 {
+                    vendor.insert(id);
+                }
+            }
+            _ => {}
+        }
+        i += 1 + len;
+    }
+    ensure!(stack.is_empty(), "unclosed HID global scope");
+    let ids: Vec<_> = if vendor.is_empty() {
+        bits.keys().copied().collect()
+    } else {
+        vendor.into_iter().collect()
+    };
+    let reports: Vec<_> = ids
+        .into_iter()
+        .filter_map(|id| {
+            let len = bits[&id].div_ceil(8);
+            (len == 64).then_some(FeatureReport { id, len })
+        })
+        .collect();
+    ensure!(
+        reports.len() == 1,
+        "expected one 64-byte vendor feature report, found {}",
+        reports.len()
+    );
+    Ok(reports[0])
+}
+
+pub fn feature_report(device: &HidDevice) -> Result<FeatureReport> {
+    let mut descriptor = [0; 4096];
+    let n = device
+        .get_report_descriptor(&mut descriptor)
+        .context("cannot read HID feature descriptor")?;
+    parse_feature_report(&descriptor[..n])
+}
+
+pub fn decode_feature_report(wire: &[u8], report: FeatureReport) -> Result<Packet> {
+    if wire.len() == report.len + 1 {
+        ensure!(wire[0] == report.id, "unexpected feature report ID");
+        Ok(wire[1..].try_into()?)
+    } else {
+        crate::protocol::decode_feature(wire)
+    }
 }
 
 /// Recover complete report sizes, including padding and split main items.
@@ -230,6 +324,7 @@ pub struct Channel {
     device: HidDevice,
     kind: Kind,
     reports: Option<Reports>,
+    feature: FeatureReport,
     exchanges: Option<Arc<AtomicUsize>>,
     last_bt_send: Mutex<Option<Instant>>,
 }
@@ -256,10 +351,16 @@ impl Channel {
         } else {
             None
         };
+        let feature = if kind == Kind::Bluetooth {
+            FeatureReport { id: 0, len: 64 }
+        } else {
+            feature_report(&device)?
+        };
         let channel = Self {
             device,
             kind,
             reports,
+            feature,
             exchanges: None,
             last_bt_send: Mutex::new(None),
         };
@@ -288,6 +389,7 @@ impl Channel {
 
     fn set_feature(&self, data: &[u8]) -> Result<()> {
         let mut wire = [0; 65];
+        wire[0] = self.feature.id;
         wire[1..1 + data.len()].copy_from_slice(data);
         self.device
             .send_feature_report(&wire)
@@ -296,11 +398,12 @@ impl Channel {
 
     fn get_feature(&self) -> Result<Packet> {
         let mut wire = [0; 65];
+        wire[0] = self.feature.id;
         let n = self
             .device
             .get_feature_report(&mut wire)
             .context("HID feature read failed")?;
-        crate::protocol::decode_feature(&wire[..n])
+        decode_feature_report(&wire[..n], self.feature)
     }
 
     fn dongle_status(&self) -> Result<Packet> {

@@ -2,7 +2,7 @@
 name = "monsgeek-linux"
 version = "0.1.0"
 edition = "2024"
-description = "Experimental original MonsGeek M1W USB configurator"
+description = "Linux configurator for MonsGeek keyboards"
 license = "MIT"
 
 [dependencies]

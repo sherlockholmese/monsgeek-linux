@@ -1,4 +1,6 @@
-# Original mechanical M1W USB configuration protocol
+# MonsGeek configuration protocols
+
+Sections1–8 document original mechanical M1W observations; [section9](#9-model-aware-families-and-snapshots) describes the current catalog-wide implementation.
 
 All byte offsets are zero-based in the **64-byte feature payload**, excluding the
 HID report-ID prefix. Hexadecimal opcodes below are always prefixed `0x`. Unless
@@ -373,3 +375,115 @@ Status requests share the100ms send spacing. Battery values outside0..100 are
 errors. A sleeping receiver does not mask an available Bluetooth keyboard.
 These are offline implementation checks, not evidence of Bluetooth hardware
 support on the original M1W.
+
+## 9. Model-aware families and snapshots
+
+Sections1–8 preserve original-M1W evidence and framing. The current implementation
+selects codecs from the 52-model [catalog](KEYBOARDS.md), rather than assuming
+that every board uses ID983's addresses. USB VID/PID is never sufficient identity.
+The internal ID remains the little-endian u32 at0x8F response bytes1..4. Unknown
+IDs are refused, and writes recheck the identified ID.
+
+Both families use64-byte feature payloads. USB/boot descriptors determine the
+actual HID report ID, including numbered reports. The parser prefers the vendor
+64-byte collection; a unique64-byte feature report can identify the vendor's
+consumer-page boot interfaces. Wireless envelopes retain the complete payload.
+The access rule enumerates exact catalog/receiver pairs and remains scoped to
+configuration/boot interfaces; its historical filename is kept for upgrades.
+
+### RY5088 and YC3123 configuration headers
+
+This table describes the implemented newer family. All checksums are B7 except
+main/side lighting (B8), and data begins at byte8 where specified.
+
+| Feature | SET | GET / read layout |
+|---|---|---|
+| Firmware revision | — |0x8F response u16LE at7..8 |
+| RF/version fallback | — |0x80 response u16LE at1..2 |
+| Active profile |0x04, profile at1 |0x84, profile at1 |
+| Report rate |0x03, selector0 at1, enum at2 |0x83, enum at2 |
+| Debounce |0x06, value at1 |0x86, value at1 |
+| Keyboard options |0x09, selector0 at1, four bytes at2..5 |0x89, bytes2..5 |
+| Main lighting |0x07, existing mode/speed/brightness/flags/RGB header |0x87 |
+| Side lighting |0x08, own effect namespace and direct speed |0x88 |
+| Base map | Single0x0A `[profile,slot,0,0,1,output]`, binding8..11 |0x8A `[profile,255,page,output]`,8 raw64-byte pages |
+| Fn map | Single0x10 `[system,index,slot]`, binding8..11 |0x90 `[system,index,255,page]`,8 raw64-byte pages |
+| Macro |0x0B, five56-byte write pages (last32) |0x8B `[slot,255,page]`, four64-byte pages |
+| Selected RGB |0x0C `[picture,255,page,length,final]`, data8 |0x8C `[picture,255,page]`, six64-byte pages |
+| Wireless timers |0x11, four u16LE values at8..15 |0x91, values8..15 |
+| Auto OS |0x17, boolean at1 |0x97, boolean at1 |
+
+Report-rate enum order is8000,4000,2000,1000,500,250,125Hz. A model's advertised
+ceiling limits selectable rates. Keyboard option bytes are Fn-map selector,
+anti-mistouch, rapid-trigger stability and WASD swap. These are not the legacy
+three-byte bitfields. Sleep controls/ranges follow metadata; missing controls
+are not invented from generic methods.
+
+Each map preserves all128 four-byte tuples. A magnetic profile has four binding
+outputs, stored in snapshot base-map index `profile * 4 + output`. Modern headers
+encode profile and output separately; Fn maps encode Windows0/macOS1 and local
+Fn index independently. Legacy magnetic active-profile selection uses
+`logical_profile * 4`. Source defaults and Reset use the model's concrete Fn Mac
+matrix for macOS maps.
+
+RGB writes preserve all384 bytes, correcting the newer host writer's378-byte
+limit. The selected picture is read at Apply and inserted in modern headers.
+Snapshots still capture one picture; an all-picture capture intentionally changes
+selection and restores the prior lighting. Picture-count3/5 comes from metadata.
+Palette flags/colors and main speed maximum5/4 differ by family/model. Brightness
+or speed edits preserve existing raw color/flag encodings.
+
+### Magnetic arrays, precision and calibration
+
+GET0xE5 uses `[parameter,1,page]` and returns raw64-byte pages. SET0x65 uses
+`[parameter,1,page,final]`,56 data bytes per page at8. Full arrays are preserved
+when editing one key. Parameter sizes:
+
+| Parameter | Meaning | YC500 bytes | RY5088 bytes |
+|---|---|---|---|
+|0/1 | Actuation/release |128 |256LE words |
+|2/3 | Rapid press/release |128 |256LE words |
+|4 | Dynamic threshold |128 |256LE words |
+|5 | Tap-hold duration (10ms units) |128 |128 |
+|6 | Bottom dead zone |128 |256LE words |
+|7 | Key behavior plus RT bit7 |128 |128 |
+|9 | Snap partner slot |128 |128 |
+|10 | DKS, four output planes |512 |512 |
+|251 | Top dead zone | — |128, revision-gated |
+|252 | Switch type |128 if replaceable |128 if replaceable |
+
+DKS readback is four channel planes. Writes transpose it into128 per-key
+records: opcode0x65 parameter8, mode0, slot at3, final at4, four output bytes
+at8..11. Each output byte has four2-bit stage states. It is not written as a
+parameter10 bulk page. Snap edits detach previous reciprocal partners and update
+both directions.
+
+YC500 uses its legacy tenths-of-mm offset conventions. Newer precision follows
+the nonzero RF version (falling back to USB) and, where present,0xE6's`AA` feature marker: precision codes0/1/2
+mean100/200/1000 units per mm. The feature response also declares optional
+keyboard/gamepad output mode (GET0x9D/SET0x1D). Top dead zone is gated on revision
+at least0x0400. Typed edits enforce model bounds and exact representability.
+Raw captures retain unknown values for lossless backups.
+
+Calibration is an explicit USB-only sequence: SET0x1C with1, wait4s; SET0x1C
+with0, wait2s; SET0x1E with1, wait2s. Finish is SET0x1E with0, wait2s. The caller
+saves a fresh configuration first. This is not a reversible settings transaction:
+configuration exports do not capture previous sensor calibration. Live travel
+normalizes legacy calibration reports and decodes newer word arrays to mm.
+Neither calibration nor new-model travel has physical validation in this pass.
+
+### Format3 and transaction boundaries
+
+Format3 adds `advanced` to the existing snapshot: optional RF revision, precision,
+modern options, report rate, side lighting, raw magnetic arrays, legacy preset
+and optional output mode. Required model fields/dimensions are validated.
+Format1/2 original exports remain readable. Snapshot/profile/picture/undo paths
+reject another model even at the same revision. Magnetic restores and performance
+profile loads also require matching precision. Advanced changes use a full fresh
+read for stale-state checks and final requested-draft comparison.
+
+Original ID983's inactive-layer selection workaround and macro-induced
+picture0 preservation are scoped to that ID. They are observed firmware behavior,
+not universal protocol steps. Transactions are not atomic; failures stop without
+automatic retry or a general recovery guarantee. New-family evidence is host
+source and offline tests, not hardware observation.

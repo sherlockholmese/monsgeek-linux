@@ -1,16 +1,18 @@
-# Original M1W configuration and shared experimental boot interfaces.
+# MonsGeek model catalog configuration and shared experimental boot interfaces.
 # No world-writable keyboard devices.
 # Match USB device and interface in separate rules: ATTRS and KERNELS in a
 # single rule would have to match the same ancestor, which these do not.
 
-# USB cable (3151:4015) and 2.4 GHz receiver (3151:4011), interface 2 only.
-ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4015|4011", ENV{MONSGEEK_M1W_CANDIDATE}="1"
+# Supported USB configuration and receiver IDs, interface 2 only.
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3151", ATTRS{idProduct}=="4011|4014|4015|4017|4021|4027|402d|4035|4038|5002|5006|5007|5008|5020|5026|5029|502b|502d|502e|502f|5030|5031|5037|5038|503d|503f|5040|5042|5045|504b|504e|5050|5052|5055|505a", ENV{MONSGEEK_M1W_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="38ee", ATTRS{idProduct}=="0000|0001|0002|0004|0009|0040", ENV{MONSGEEK_M1W_CANDIDATE}="1"
+ACTION=="add|change", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="39ab", ATTRS{idProduct}=="9016", ENV{MONSGEEK_M1W_CANDIDATE}="1"
 ACTION=="add|change", SUBSYSTEM=="hidraw", ENV{MONSGEEK_M1W_CANDIDATE}=="1", KERNELS=="*:1.2", TAG+="uaccess"
 
 # Bluetooth LE (bus 0005). BlueZ exposes one hidraw node per device carrying
 # every collection, so this also grants the active login the key reports of
 # that keyboard. Remove this line if you do not configure over Bluetooth.
-ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:3151:*", TAG+="uaccess"
+ACTION=="add|change", SUBSYSTEM=="hidraw", KERNELS=="0005:3151:*|0005:38EE:*|0005:39AB:*", TAG+="uaccess"
 
 # Experimental firmware boot interfaces from the vendor bootKeyboard filters.
 # Shared boot IDs are not model identities; the updater also checks the original USB port.

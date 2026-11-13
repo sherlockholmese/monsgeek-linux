@@ -38,7 +38,11 @@ pub fn rows(base: &Snapshot, draft: &Snapshot) -> Result<Vec<Row>> {
     let mut rows = Vec::new();
     for change in &base.restore_changes(draft)? {
         let old = base.inverse(change)?;
-        for (before, after) in fields(&old).into_iter().zip(fields(change)) {
+        let precision = base.advanced.as_ref().map_or(100, |a| a.units_per_mm);
+        for (before, after) in fields(&old, base.model()?, precision)
+            .into_iter()
+            .zip(fields(change, base.model()?, precision))
+        {
             if before.value != after.value {
                 rows.push(Row {
                     setting: after.setting,
@@ -69,8 +73,162 @@ fn seconds(value: u16) -> String {
     }
 }
 
-fn fields(change: &Change) -> Vec<Field> {
+fn advanced_fields(
+    change: &crate::advanced::Change,
+    model: &crate::models::Model,
+    precision: u16,
+) -> Vec<Field> {
+    use crate::advanced::{Change as A, Settings};
     match change {
+        A::Options { bytes } => vec![
+            field("Fn map", None, format!("{}", u16::from(bytes[0]) + 1)),
+            field("Prevent accidental presses", None, on(bytes[1] != 0)),
+            field(
+                "Rapid trigger stability",
+                None,
+                format!("{}", u16::from(bytes[2]) * 25),
+            ),
+            field("Swap WASD and arrows", None, on(bytes[3] != 0)),
+        ],
+        A::ReportRate { hz } => vec![field("Report rate", None, format!("{hz} Hz"))],
+        A::MagneticMode { value } => vec![field(
+            "Actuation preset",
+            None,
+            ["Comfort", "Sensitive", "Gaming", "Custom"]
+                .get(usize::from(*value))
+                .copied()
+                .unwrap_or("Unknown"),
+        )],
+        A::OutputMode { value } => vec![field(
+            "Output mode",
+            None,
+            if *value == 0 { "Keyboard" } else { "Gamepad" },
+        )],
+        A::SideLighting { settings: l } => vec![
+            field(
+                "Side lighting",
+                Some("Effect"),
+                [
+                    "Off",
+                    "Static",
+                    "Breathing",
+                    "Neon",
+                    "Wave",
+                    "Snake",
+                    "Music",
+                ]
+                .get(usize::from(l.mode))
+                .copied()
+                .unwrap_or("Unknown"),
+            ),
+            field(
+                "Side lighting",
+                Some("Brightness"),
+                format!("{}/4", l.brightness),
+            ),
+            field(
+                "Side lighting",
+                Some("Speed"),
+                format!("{}/4", l.wire_speed),
+            ),
+            field(
+                "Side lighting",
+                Some("Direction"),
+                format!("{}", l.flags >> 4),
+            ),
+            field(
+                "Side lighting",
+                Some("Rainbow"),
+                on(l.flags & 15 == model.dazzle),
+            ),
+            field("Side lighting", Some("Color"), hex(&l.rgb)),
+        ],
+        A::Magnetic { parameter, data } => {
+            let mut settings = Settings {
+                units_per_mm: precision,
+                ..Default::default()
+            };
+            settings.magnetic.insert(*parameter, data.clone());
+            let mut fields = Vec::new();
+            for slot in 0..128u8 {
+                let row = |scope: &str, value: String| Field {
+                    slot: Some(slot),
+                    ..field(model.slot_name(slot), Some(scope), value)
+                };
+                if *parameter == 10 {
+                    for output in 0..4usize {
+                        let byte = data[output * 128 + usize::from(slot)];
+                        let stages = (0..4)
+                            .map(|stage| {
+                                ["Off", "Tap", "End hold", "Start hold"]
+                                    [usize::from((byte >> (stage * 2)) & 3)]
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        fields.push(row(&format!("Dynamic output {}", output + 1), stages));
+                    }
+                } else if *parameter == 7 {
+                    let value = data[usize::from(slot)];
+                    fields.push(row(
+                        "Behavior",
+                        match value & 127 {
+                            0 => "Normal".into(),
+                            2 => "Dynamic".into(),
+                            3 => "Tap-hold".into(),
+                            4 => "Hold toggle".into(),
+                            5 => "Tap toggle".into(),
+                            7 => "Snap pair".into(),
+                            n => format!("Vendor mode {n}"),
+                        },
+                    ));
+                    fields.push(row("Rapid trigger", on(value & 128 != 0)));
+                } else if *parameter == 9 {
+                    fields.push(row(
+                        "Snap partner",
+                        model.slot_name(data[usize::from(slot)]),
+                    ));
+                } else if *parameter == 252 {
+                    let code = data[usize::from(slot)];
+                    fields.push(row(
+                        "Switch",
+                        model
+                            .switches
+                            .iter()
+                            .find(|s| s.code == code)
+                            .map(|s| s.label.clone())
+                            .unwrap_or_else(|| format!("Switch {code}")),
+                    ));
+                } else {
+                    let value = settings.value(model, *parameter, slot).unwrap_or(0.);
+                    let name = match parameter {
+                        0 => "Actuation",
+                        1 => "Release",
+                        2 => "Rapid press",
+                        3 => "Rapid release",
+                        4 => "Dynamic threshold",
+                        5 => "Tap-hold time",
+                        6 => "Bottom dead zone",
+                        251 => "Top dead zone",
+                        _ => "Magnetic setting",
+                    };
+                    fields.push(row(
+                        name,
+                        if *parameter == 5 {
+                            format!("{value:.0} ms")
+                        } else {
+                            format!("{value:.3} mm")
+                        },
+                    ));
+                }
+            }
+            fields
+        }
+    }
+}
+
+fn fields(change: &Change, model: &crate::models::Model, precision: u16) -> Vec<Field> {
+    match change {
+        Change::Advanced { change } => advanced_fields(change, model, precision),
         Change::Rgb { data } => data
             .as_chunks::<3>()
             .0
@@ -78,7 +236,7 @@ fn fields(change: &Change) -> Vec<Field> {
             .enumerate()
             .map(|(slot, rgb)| Field {
                 slot: Some(slot as u8),
-                ..field(keys::slot_name(slot as u8), Some("Color"), hex(rgb))
+                ..field(model.slot_name(slot as u8), Some("Color"), hex(rgb))
             })
             .collect(),
         Change::Remap {
@@ -89,7 +247,7 @@ fn fields(change: &Change) -> Vec<Field> {
         } => vec![Field {
             slot: Some(*slot),
             ..field(
-                keys::slot_name(*slot),
+                model.slot_name(*slot),
                 Some(&format!(
                     "Layer {}{}",
                     layer + 1,
