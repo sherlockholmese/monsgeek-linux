@@ -130,6 +130,40 @@ pub fn heading(title: impl Into<SharedString>, cx: &App) -> impl IntoElement {
         .child(title.into())
 }
 
+/// Section label with the actions that act on that section.
+pub fn heading_row(
+    title: impl Into<SharedString>,
+    actions: impl IntoElement,
+    cx: &App,
+) -> AnyElement {
+    h_flex()
+        .gap_2()
+        .child(heading(title, cx))
+        .child(div().flex_1())
+        .child(actions)
+        .into_any_element()
+}
+
+/// One line of live state, aligned with section content.
+pub fn status(text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    div()
+        .pl_6()
+        .text_sm()
+        .text_color(cx.theme().muted_foreground)
+        .child(text.into())
+        .into_any_element()
+}
+
+/// A failure, placed beside the action it concerns.
+pub fn error(text: impl Into<SharedString>, cx: &App) -> AnyElement {
+    div()
+        .pl_6()
+        .text_sm()
+        .text_color(cx.theme().danger)
+        .child(text.into())
+        .into_any_element()
+}
+
 /// A setting with a leading icon.
 pub fn icon_row(
     icon: impl Into<Icon>,

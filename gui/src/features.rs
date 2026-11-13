@@ -13,13 +13,14 @@ use gpui_kit::component::{
     h_flex,
     input::{Input, InputEvent, InputState, Textarea, TextareaState},
     notification::Notification,
+    slider::{Slider, SliderEvent, SliderState, SliderValue},
     switch::Switch,
     v_flex,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
-    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, ParentElement, SharedString, Styled,
-    Subscription, Window, div, prelude::FluentBuilder, px,
+    AnyElement, AppContext, Context, Entity, FocusHandle, InteractiveElement, IntoElement,
+    KeyDownEvent, KeyUpEvent, ModifiersChangedEvent, ParentElement, Styled, Subscription, Window,
+    div, prelude::FluentBuilder, px,
 };
 use monsgeek_linux::{
     device::Snapshot,
@@ -50,15 +51,29 @@ pub struct Features {
     pub tester_focus: FocusHandle,
     pub held: BTreeSet<u8>,
     pub seen: BTreeSet<u8>,
-    pub events: VecDeque<String>,
+    /// Newest first: what was received, and whether it went down or up.
+    pub events: VecDeque<(String, Option<&'static str>)>,
     pub host_editor: Entity<TextareaState>,
     pub host_error: Option<String>,
     pub host_process: Option<desktop::HostProcess>,
     pub host_config: Option<host::Config>,
+    pub host_devices: Result<Vec<(String, PathBuf)>, String>,
     pub picture_backup: Option<monsgeek_linux::pictures::Backup>,
-    pub operation: Option<String>,
+    pub picture_error: Option<String>,
+    pub battery: Entity<SliderState>,
     _blur: Subscription,
     _host_edits: Subscription,
+    _battery: Subscription,
+}
+
+fn input_devices() -> Result<Vec<(String, PathBuf)>, String> {
+    let mut devices: Vec<_> = host::linux::devices()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .map(|d| (d.name, d.path))
+        .collect();
+    devices.sort();
+    Ok(devices)
 }
 impl Features {
     pub fn new(window: &mut Window, cx: &mut Context<Workbench>) -> Self {
@@ -82,13 +97,34 @@ impl Features {
                 cx.notify();
             }
         });
+        let preferences = settings::load();
+        let battery = cx.new(|_| {
+            SliderState::new()
+                .min(5.)
+                .max(50.)
+                .step(5.)
+                .default_value(f32::from(preferences.battery_threshold))
+        });
+        let battery_changes = cx.subscribe(&battery, |this, _, event: &SliderEvent, cx| {
+            let SliderEvent::Change(value) = event else {
+                return;
+            };
+            let value = match value {
+                SliderValue::Single(v) | SliderValue::Range(_, v) => *v,
+            } as u8;
+            if value != this.features.preferences.battery_threshold {
+                this.features.preferences.battery_threshold = value;
+                this.features.battery_latched = false;
+                this.save_preferences(cx);
+            }
+        });
         Self {
             profiles: profiles.unwrap_or_default(),
             profile_error: error,
             selection: Selection::default(),
             name: cx.new(|cx| InputState::new(window, cx).placeholder("For example, Coding")),
             source: None,
-            preferences: settings::load(),
+            preferences,
             autostart: desktop::autostart_enabled(),
             tray: None,
             desktop_error: None,
@@ -102,10 +138,13 @@ impl Features {
             host_error: None,
             host_process: None,
             host_config: None,
+            host_devices: input_devices(),
             picture_backup: None,
-            operation: None,
+            picture_error: None,
+            battery,
             _blur: blur,
             _host_edits: host_edits,
+            _battery: battery_changes,
         }
     }
     pub fn test_event(&mut self, usage: Option<u8>, label: String, down: bool) {
@@ -120,10 +159,10 @@ impl Features {
                 self.held.remove(&usage);
             }
         }
-        self.events.push_front(format!(
-            "{}  {label}",
-            if down { "Press" } else { "Release" }
-        ));
+        self.log_event(label, Some(if down { "Down" } else { "Up" }));
+    }
+    pub fn log_event(&mut self, label: String, kind: Option<&'static str>) {
+        self.events.push_front((label, kind));
         self.events.truncate(100);
     }
 }
@@ -263,14 +302,14 @@ impl Workbench {
                                 window.activate_window();
                                 if this.busy.is_none() && let Ok(profile) = profiles::load(&path) { this.load_profile(profile,window,cx); }
                             }
-                            desktop::Event::StopHost => { this.features.host_process = None; this.features.operation = Some("Host remapping stopped".into()); }
+                            desktop::Event::StopHost => { this.features.host_process = None; cx.notify(); }
                             desktop::Event::Quit => { this.features.host_process = None; cx.quit(); }
                         }
                     }
                     if let Some(process) = &mut this.features.host_process {
                         match process.0.try_wait() {
                             Ok(Some(status)) => {
-                                if status.success() { this.features.host_error=None; this.features.operation=Some("Host remapping stopped".into()); } else { let error=process.1.lock().unwrap_or_else(|e|e.into_inner()).clone(); this.features.host_error = Some(if error.trim().is_empty(){format!("Host remapping stopped ({status}). Check the configuration and input permissions.")}else{error.trim().to_owned()}); }
+                                if status.success() { this.features.host_error=None; } else { let error=process.1.lock().unwrap_or_else(|e|e.into_inner()).clone(); this.features.host_error = Some(if error.trim().is_empty(){format!("Host remapping stopped ({status}). Check the configuration and input permissions.")}else{error.trim().to_owned()}); }
                                 this.features.host_process = None;
                                 cx.notify();
                             }
@@ -337,13 +376,13 @@ impl Workbench {
         }
         if let Some(tray) = &self.features.tray {
             let status = match presence.wireless {
-                Some((kind, Some(battery))) => format!("{kind} · {battery}%"),
+                Some((kind, Some(battery))) => format!("{kind}, {battery}%"),
                 Some((_, None)) if !presence.usb => "Asleep".into(),
                 _ if presence.usb => "USB".into(),
                 _ => "Disconnected".into(),
             };
             tray.handle
-                .update(move |tray| tray.title = format!("MonsGeek M1W · {status}"));
+                .update(move |tray| tray.title = format!("MonsGeek M1W ({status})"));
         }
     }
     pub fn export_diagnostics(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -363,13 +402,9 @@ impl Workbench {
         cx.spawn_in(window, async move |this, cx| {
             if let Ok(Ok(Some(path))) = prompt.await {
                 let result = monsgeek_linux::transaction::save_new(&path, &report);
-                this.update_in(cx, |this, window, cx| {
+                this.update_in(cx, |_, window, cx| {
                     match result {
                         Ok(()) => {
-                            this.features.operation = Some(
-                                "Diagnostics exported without keymaps, macros, or recorded input"
-                                    .into(),
-                            );
                             window.push_notification(
                                 Notification::success("Diagnostics exported"),
                                 cx,
@@ -392,16 +427,37 @@ impl Workbench {
             return;
         }
         let view = cx.entity();
-        window.open_dialog(cx,move |dialog,_,_| {
+        window.open_dialog(cx, move |dialog, _, _| {
             let capture = view.clone();
-            dialog.title("Back up all RGB pictures").w(px(520.))
-                .child(div().text_sm().child("This briefly selects each of the three pictures, saves their colours, and restores the original lighting effect. A recovery snapshot is saved before selection changes."))
-                .footer(h_flex().w_full().justify_end().gap_2()
-                    .child(Button::new("capture-cancel").ghost().label("Cancel").on_click(|_,window,cx|window.close_dialog(cx)))
-                    .child(Button::new("capture-pictures").primary().label("Back up pictures").on_click(move |_,window,cx| {
-                        window.close_dialog(cx);
-                        capture.update(cx,|this,cx|this.choose_picture_path(window,cx));
-                    })))
+            dialog
+                .title("Back up all pictures")
+                .w(px(480.))
+                .child(div().text_sm().child(
+                    "Each picture is selected briefly, then the current lighting is restored.",
+                ))
+                .footer(
+                    h_flex()
+                        .w_full()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            Button::new("capture-cancel")
+                                .ghost()
+                                .label("Cancel")
+                                .on_click(|_, window, cx| window.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("capture-pictures")
+                                .primary()
+                                .label("Back up all")
+                                .on_click(move |_, window, cx| {
+                                    window.close_dialog(cx);
+                                    capture.update(cx, |this, cx| {
+                                        this.choose_picture_path(window, cx)
+                                    });
+                                }),
+                        ),
+                )
         });
     }
     fn choose_picture_path(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -417,7 +473,7 @@ impl Workbench {
                         return false;
                     }
                     this.busy = Some(Busy::Capturing);
-                    this.features.operation = Some("Backing up three RGB pictures…".into());
+                    this.features.picture_error = None;
                     cx.notify();
                     true
                 })
@@ -441,11 +497,11 @@ impl Workbench {
                 match result {
                     Ok(backup) => {
                         this.features.picture_backup = Some(backup);
-                        this.features.operation =
-                            Some("All three pictures saved; original lighting restored".into());
+                        window.push_notification(Notification::success("Pictures backed up"), cx);
                     }
                     Err(e) => {
-                        this.features.operation = Some(format!("Picture backup failed: {e}"));
+                        this.features.picture_error =
+                            Some(format!("Backup failed. {}", first_line(&e)));
                         this.log(Entry::error("Picture backup failed", &e));
                     }
                 }
@@ -475,8 +531,11 @@ impl Workbench {
                 })();
                 this.update_in(cx, |this, _, cx| {
                     match result {
-                        Ok(backup) => this.features.picture_backup = Some(backup),
-                        Err(e) => this.features.operation = Some(e.to_string()),
+                        Ok(backup) => {
+                            this.features.picture_backup = Some(backup);
+                            this.features.picture_error = None;
+                        }
+                        Err(e) => this.features.picture_error = Some(first_line(&e).to_string()),
                     }
                     cx.notify();
                 })
@@ -496,7 +555,7 @@ impl Workbench {
                     self.sync_controls(window, cx);
                     self.page = Page::Review;
                 }
-                Err(e) => self.features.operation = Some(e.to_string()),
+                Err(e) => self.features.picture_error = Some(first_line(&e).to_string()),
             }
         }
         cx.notify();
@@ -591,7 +650,7 @@ impl Workbench {
         window.open_dialog(cx,move |dialog,_,_| {
             let start=view.clone();let config=config.clone();
             dialog.title("Start host remapping").w(px(520.))
-                .child(div().text_sm().child("The selected input devices will be captured exclusively and remapped on this computer. Ctrl+Alt+Esc stops the service. Closing this app stops it too. Input and uinput permissions must already be configured."))
+                .child(div().text_sm().child("The configured input devices are captured exclusively. Press Ctrl+Alt+Esc to stop."))
                 .footer(h_flex().w_full().justify_end().gap_2()
                     .child(Button::new("host-cancel").ghost().label("Cancel").on_click(|_,window,cx|window.close_dialog(cx)))
                     .child(Button::new("host-start-confirm").primary().label("Start remapping").on_click(move |_,window,cx| {
@@ -612,13 +671,6 @@ impl Workbench {
     }
 }
 
-fn message(text: impl Into<SharedString>, cx: &App) -> AnyElement {
-    div()
-        .text_sm()
-        .text_color(cx.theme().muted_foreground)
-        .child(text.into())
-        .into_any_element()
-}
 pub fn render(
     this: &mut Workbench,
     _window: &mut Window,
@@ -633,121 +685,135 @@ pub fn render(
         _ => return None,
     })
 }
+
 fn profiles_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
-    let mut rows = vec![
-        h_flex()
-            .py_3()
-            .gap_3()
-            .child(message(
-                "Save the current draft as a named configuration.",
-                cx,
-            ))
-            .child(div().flex_1())
-            .child(
-                Button::new("new-profile")
-                    .outline()
-                    .label("Save current draft")
-                    .disabled(this.draft.is_none() || this.busy.is_some())
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        if let Some(snapshot) = this.draft.clone() {
-                            this.name_profile(snapshot, String::new(), window, cx)
-                        }
-                    })),
-            )
-            .into_any_element(),
-    ];
-    for (index, (_, profile)) in this.features.profiles.clone().into_iter().enumerate() {
-        let load = profile.clone();
-        rows.push(
+    let theme = cx.theme().clone();
+    let current = this.baseline.as_ref().map(|b| b.usb_revision);
+    let save = Button::new("new-profile")
+        .outline()
+        .small()
+        .icon(gpui_kit::assets::IconName::Plus)
+        .label("Save profile")
+        .disabled(this.draft.is_none() || this.busy.is_some())
+        .on_click(cx.listener(|this, _, window, cx| {
+            if let Some(snapshot) = this.draft.clone() {
+                this.name_profile(snapshot, String::new(), window, cx)
+            }
+        }));
+    let rows: Vec<AnyElement> = this
+        .features
+        .profiles
+        .clone()
+        .into_iter()
+        .enumerate()
+        .map(|(index, (_, profile))| {
+            let load = profile.clone();
+            let revision = profile.snapshot.usb_revision;
             h_flex()
-                .py_3()
-                .gap_3()
+                .min_h(px(52.))
+                .py_2()
+                .gap_4()
                 .child(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .child(div().text_sm().child(profile.name.clone()))
-                        .child(message(
-                            format!("Firmware {:04X}", profile.snapshot.usb_revision),
-                            cx,
-                        )),
+                        .text_sm()
+                        .font_weight(gpui_kit::FontWeight::MEDIUM)
+                        .child(profile.name.clone()),
                 )
+                // Firmware only matters when it differs from the keyboard's.
+                .when(current.is_some_and(|c| c != revision), |d| {
+                    d.child(
+                        div()
+                            .flex_shrink_0()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(crate::app::firmware_label(revision)),
+                    )
+                })
                 .child(
-                    Button::new(("duplicate-profile", index))
-                        .ghost()
-                        .small()
-                        .label("Duplicate")
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.name_profile(
-                                profile.snapshot.clone(),
-                                format!("{} copy", profile.name),
-                                window,
-                                cx,
-                            )
-                        })),
+                    h_flex()
+                        .flex_shrink_0()
+                        .gap_2()
+                        .child(
+                            Button::new(("duplicate-profile", index))
+                                .ghost()
+                                .small()
+                                .label("Duplicate")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.name_profile(
+                                        profile.snapshot.clone(),
+                                        format!("{} copy", profile.name),
+                                        window,
+                                        cx,
+                                    )
+                                })),
+                        )
+                        .child(
+                            Button::new(("load-profile", index))
+                                .outline()
+                                .small()
+                                .label("Load")
+                                .disabled(!this.editable())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.load_profile(load.clone(), window, cx)
+                                })),
+                        ),
                 )
-                .child(
-                    Button::new(("load-profile", index))
-                        .outline()
-                        .small()
-                        .label("Load for review")
-                        .disabled(!this.editable())
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.load_profile(load.clone(), window, cx)
-                        })),
-                )
-                .into_any_element(),
-        );
-    }
-    if this.features.profiles.is_empty() {
-        rows.push(message(
-            "No named profiles yet. Saved profiles stay on this computer.",
-            cx,
-        ));
-    }
+                .into_any_element()
+        })
+        .collect();
     let s = this.features.selection;
-    let selections: Vec<_> = [
-        ("Keys", s.keys, 0),
-        ("Macros", s.macros, 1),
-        ("Lighting", s.lighting, 2),
-        ("Performance", s.performance, 3),
-        ("Keyboard options", s.options, 4),
-        ("Active layer", s.active_layer, 5),
-    ]
-    .into_iter()
-    .map(|(label, on, index)| {
-        div()
-            .py_2()
-            .child(
-                Checkbox::new(("profile-part", index as usize))
+    let parts = h_flex()
+        .flex_wrap()
+        .py_4()
+        .gap_x_6()
+        .gap_y_3()
+        .children(
+            [
+                ("Keys", s.keys),
+                ("Macros", s.macros),
+                ("Lighting", s.lighting),
+                ("Performance", s.performance),
+                ("Keyboard options", s.options),
+                ("Active layer", s.active_layer),
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, (label, on))| {
+                Checkbox::new(("profile-part", index))
                     .label(label)
                     .checked(on)
                     .on_click(cx.listener(move |this, on: &bool, _, cx| {
-                        match index {
-                            0 => this.features.selection.keys = *on,
-                            1 => this.features.selection.macros = *on,
-                            2 => this.features.selection.lighting = *on,
-                            3 => this.features.selection.performance = *on,
-                            4 => this.features.selection.options = *on,
-                            _ => this.features.selection.active_layer = *on,
-                        }
+                        let s = &mut this.features.selection;
+                        *[
+                            &mut s.keys,
+                            &mut s.macros,
+                            &mut s.lighting,
+                            &mut s.performance,
+                            &mut s.options,
+                            &mut s.active_layer,
+                        ][index] = *on;
                         cx.notify();
-                    })),
-            )
-            .into_any_element()
-    })
-    .collect();
-    let mut sections = vec![
-        ui::section("Named configurations", rows, cx),
-        ui::section("Include when loading", selections, cx),
-    ];
-    if let Some(error) = &this.features.profile_error {
-        sections.insert(0, message(error.clone(), cx));
+                    }))
+            }),
+        )
+        .into_any_element();
+    let mut sections = vec![ui::heading_row("Saved", save, cx)];
+    if rows.is_empty() {
+        sections.push(ui::placeholder("No saved profiles", 96., cx));
+    } else {
+        sections.push(ui::section("", rows, cx));
     }
-    sections.push(message("Lighting includes only the picture captured in the profile. Load keys and macros together when bindings reference saved macros.",cx));
+    if let Some(error) = &this.features.profile_error {
+        sections.push(ui::error(error.clone(), cx));
+    }
+    sections.push(ui::section("Load includes", vec![parts], cx));
     ui::page("profiles", sections).into_any_element()
 }
+
 fn review_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
+    let theme = cx.theme().clone();
     let rows = match (&this.baseline, &this.draft) {
         (Some(b), Some(d)) => review::rows(b, d),
         _ => Ok(Vec::new()),
@@ -755,132 +821,99 @@ fn review_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement 
     let rows = match rows {
         Ok(rows) => rows,
         Err(e) => {
-            return ui::page("review-error", vec![message(e.to_string(), cx)]).into_any_element();
+            return ui::page("review-error", vec![ui::error(first_line(&e), cx)])
+                .into_any_element();
         }
     };
-    let changed: BTreeSet<_> = rows.iter().filter_map(|r| r.slot).collect();
-    let mut parts = vec![board(
-        "review-board",
-        |slot| Look {
-            legend: keys::slot_legend(slot).into(),
-            action: changed.contains(&slot).then(|| "Δ".into()),
-            selected: changed.contains(&slot),
-            ..Default::default()
-        },
-        None,
-        cx,
-    )];
     if rows.is_empty() {
-        parts.push(message(
-            "No pending changes. Edit a setting or load a profile to review it here.",
+        return ui::page(
+            "change-review",
+            vec![ui::placeholder("No pending changes", 96., cx)],
+        )
+        .into_any_element();
+    }
+    let changed: BTreeSet<_> = rows.iter().filter_map(|r| r.slot).collect();
+    let mut parts = Vec::new();
+    if !changed.is_empty() {
+        parts.push(board(
+            "review-board",
+            |slot| Look {
+                legend: keys::slot_legend(slot).into(),
+                selected: changed.contains(&slot),
+                ..Default::default()
+            },
+            None,
             cx,
         ));
-    } else {
-        parts.push(
-            v_flex()
-                .gap_3()
-                .children(rows.iter().map(|row| {
-                    v_flex()
-                        .py_3()
-                        .gap_1()
-                        .border_b_1()
-                        .border_color(cx.theme().border)
+    }
+    let cell = || div().flex_1().min_w_0().text_sm();
+    let line = || h_flex().min_h(px(44.)).py_2().gap_4().items_start();
+    let mut ledger = vec![
+        line()
+            .text_color(theme.muted_foreground)
+            .child(cell().child("Setting"))
+            .child(cell().child("Before"))
+            .child(cell().child("After"))
+            .into_any_element(),
+    ];
+    ledger.extend(rows.iter().map(|row| {
+        line()
+            .child(
+                cell().child(
+                    h_flex()
+                        .flex_wrap()
+                        .gap_x_2()
                         .child(
                             div()
-                                .text_sm()
                                 .font_weight(gpui_kit::FontWeight::MEDIUM)
                                 .child(row.setting.clone()),
                         )
-                        .child(
-                            h_flex()
-                                .items_start()
-                                .gap_4()
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("Before: {}", row.before)),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .min_w_0()
-                                        .text_sm()
-                                        .child(format!("After: {}", row.after)),
-                                ),
-                        )
-                }))
-                .into_any_element(),
-        );
-        parts.push(
-            h_flex()
-                .justify_end()
-                .gap_2()
-                .child(
-                    Button::new("review-apply")
-                        .primary()
-                        .label("Apply changes")
-                        .loading(this.busy == Some(Busy::Applying))
-                        .disabled(
-                            this.busy.is_some()
-                                || this.pending().is_err()
-                                || this.features.host_process.is_some(),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx))),
-                )
-                .into_any_element(),
-        );
-        parts.push(message(
-            "Apply saves a before-state and verifies each write. Changes remain local until then.",
-            cx,
-        ));
-        if this.features.host_process.is_some() {
-            parts.push(message(
-                "Stop host remapping before applying onboard changes.",
-                cx,
-            ));
-        }
+                        .when_some(row.scope.clone(), |d, scope| {
+                            d.child(div().text_color(theme.muted_foreground).child(scope))
+                        }),
+                ),
+            )
+            .child(
+                cell()
+                    .text_color(theme.muted_foreground)
+                    .child(row.before.clone()),
+            )
+            .child(cell().child(row.after.clone()))
+            .into_any_element()
+    }));
+    parts.push(ui::section("", ledger, cx));
+    if this.features.host_process.is_some() {
+        parts.push(ui::status("Stop host remapping to apply changes", cx));
     }
     if let Err(e) = this.pending() {
-        parts.push(
-            div()
-                .text_sm()
-                .text_color(cx.theme().danger)
-                .child(e.to_string())
-                .into_any_element(),
-        );
+        parts.push(ui::error(first_line(&e), cx));
     }
     ui::page("change-review", parts).into_any_element()
 }
+
 fn tester_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
+    let theme = cx.theme().clone();
     let testing = this.features.testing;
     let focus = this.features.tester_focus.clone();
-    let mut capture = v_flex()
+    let mut capture = div()
         .id("tester-capture")
         .track_focus(&focus)
-        .p_4()
-        .gap_3()
-        .rounded(cx.theme().radius_lg)
-        .bg(cx.theme().muted)
-        .child(message(
-            if testing {
-                "Listening while this panel has focus. Click elsewhere to stop."
-            } else {
-                "Start testing, then press keys or turn the knob. Events stay in memory."
-            },
-            cx,
-        ))
         .child(board(
             "tester-board",
             |slot| {
-                let binding = keys::default_binding(false, slot);
-                let usage = binding[2];
+                let usage = keys::default_binding(false, slot)[2];
+                let held = this.features.held.contains(&usage);
+                let seen = this.features.seen.contains(&usage);
                 Look {
                     legend: keys::slot_legend(slot).into(),
-                    selected: this.features.held.contains(&usage),
-                    action: this.features.seen.contains(&usage).then(|| "✓".into()),
+                    pressed: held,
+                    fill: if held {
+                        Some(theme.primary)
+                    } else if seen {
+                        Some(theme.selection)
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 }
             },
@@ -928,320 +961,382 @@ fn tester_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement 
         }))
         .on_scroll(cx.listener(|this, event: &gpui_kit::ScrollEvent, _, cx| {
             if this.features.testing {
+                let up = event.delta.pixel_delta(px(16.)).y > px(0.);
                 this.features
-                    .events
-                    .push_front(format!("Scroll {:?}", event.delta));
-                this.features.events.truncate(100);
+                    .log_event(if up { "Scroll up" } else { "Scroll down" }.into(), None);
                 cx.notify();
             }
         }));
-    for button in [
-        gpui_kit::MouseButton::Left,
-        gpui_kit::MouseButton::Right,
-        gpui_kit::MouseButton::Middle,
+    for (button, label) in [
+        (gpui_kit::MouseButton::Left, "Left button"),
+        (gpui_kit::MouseButton::Right, "Right button"),
+        (gpui_kit::MouseButton::Middle, "Middle button"),
     ] {
         capture = capture
             .on_mouse_down(
                 button,
                 cx.listener(move |this, _: &gpui_kit::MouseDownEvent, _, cx| {
-                    this.features
-                        .test_event(None, format!("Mouse {button:?}"), true);
+                    this.features.test_event(None, label.into(), true);
                     cx.notify();
                 }),
             )
             .on_mouse_up(
                 button,
                 cx.listener(move |this, _: &gpui_kit::MouseUpEvent, _, cx| {
-                    this.features
-                        .test_event(None, format!("Mouse {button:?}"), false);
+                    this.features.test_event(None, label.into(), false);
                     cx.notify();
                 }),
             );
     }
-    let events = v_flex().gap_1().children(
-        this.features
-            .events
-            .iter()
-            .take(30)
-            .map(|event| div().text_sm().child(event.clone())),
-    );
-    ui::page("tester",vec![h_flex().gap_2()
-        .child(Button::new("tester-start").outline().label("Start testing").on_click(cx.listener(|this,_,window,cx|{this.features.testing = true;this.features.held.clear();window.focus(&this.features.tester_focus,cx);cx.notify();})))
-        .child(Button::new("tester-stop").ghost().label("Stop").disabled(!testing).on_click(cx.listener(|this,_,_,cx|{this.features.testing = false;this.features.held.clear();cx.notify();})))
-        .child(Button::new("tester-reset").ghost().label("Clear").on_click(cx.listener(|this,_,_,cx|{this.features.seen.clear();this.features.events.clear();this.features.held.clear();cx.notify();}))).into_any_element(),
-        capture.into_any_element(),message("The board highlights emitted key names, not physical source positions. Fn and media actions intercepted by the desktop may not reach this window.",cx),events.into_any_element()]).into_any_element()
-}
-fn desktop_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
-    use gpui_kit::assets::IconName as I;
-    let prefs = &this.features.preferences;
-    let threshold = prefs.battery_threshold.clamp(5, 50);
-    let rows = vec![
-        ui::icon_row(
-            I::Battery,
-            "Low-battery notifications",
-            Switch::new("battery-alerts")
-                .checked(prefs.battery_alerts)
-                .on_click(cx.listener(|this, on: &bool, _, cx| {
-                    this.features.preferences.battery_alerts = *on;
-                    this.features.battery_latched = false;
-                    this.save_preferences(cx);
-                })),
-        ),
-        ui::icon_row(
-            I::BatteryLow,
-            "Notify below",
-            h_flex()
-                .gap_2()
-                .child(
-                    Button::new("battery-less")
-                        .ghost()
-                        .label("−")
-                        .disabled(threshold <= 5)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.features.preferences.battery_threshold = this
-                                .features
-                                .preferences
-                                .battery_threshold
-                                .saturating_sub(5)
-                                .max(5);
-                            this.features.battery_latched = false;
-                            this.save_preferences(cx);
-                        })),
-                )
-                .child(div().text_sm().child(format!("{threshold}%")))
-                .child(
-                    Button::new("battery-more")
-                        .ghost()
-                        .label("+")
-                        .disabled(threshold >= 50)
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.features.preferences.battery_threshold =
-                                (this.features.preferences.battery_threshold + 5).min(50);
-                            this.features.battery_latched = false;
-                            this.save_preferences(cx);
-                        })),
-                ),
-        ),
-        ui::icon_row(
-            I::Monitor,
-            "Show tray icon",
-            Switch::new("tray-enabled")
-                .checked(prefs.tray)
-                .on_click(cx.listener(|this, on: &bool, window, cx| {
-                    this.features.preferences.tray = *on;
-                    this.features.desktop_error = None;
-                    if *on {
-                        this.enable_tray(window, cx);
-                    } else {
-                        this.features.tray = None;
-                    }
-                    this.save_preferences(cx);
-                })),
-        ),
-        ui::icon_row(
-            I::Monitor,
-            "Open at login",
-            Switch::new("autostart")
-                .checked(this.features.autostart)
-                .on_click(cx.listener(|this, on: &bool, _, cx| {
-                    match std::env::current_exe()
-                        .map_err(anyhow::Error::from)
-                        .and_then(|exe| desktop::set_autostart(*on, &exe))
-                    {
-                        Ok(()) => this.features.autostart = *on,
-                        Err(e) => this.features.desktop_error = Some(e.to_string()),
+    let empty = this.features.events.is_empty() && this.features.seen.is_empty();
+    let toolbar = h_flex()
+        .gap_2()
+        .child(
+            Button::new("tester-toggle")
+                .outline()
+                .small()
+                .label(if testing {
+                    "Stop testing"
+                } else {
+                    "Start testing"
+                })
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.features.held.clear();
+                    this.features.testing = !testing;
+                    if !testing {
+                        window.focus(&this.features.tester_focus, cx);
                     }
                     cx.notify();
                 })),
-        ),
-    ];
-    let mut parts = vec![
-        ui::section("Desktop integration", rows, cx),
-        message(
-            "Battery levels are available over wireless links. Tray support depends on your desktop's StatusNotifier host. Open at login starts this app; host remapping still needs Start.",
-            cx,
-        ),
-        ui::section(
-            "Support",
-            vec![ui::icon_row(
-                I::Download,
-                "Support report",
-                Button::new("diagnostics-export")
-                    .outline()
-                    .label("Export diagnostics")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.export_diagnostics(window, cx)),
-                    ),
-            )],
-            cx,
-        ),
-    ];
-    if let Some(error) = &this.features.desktop_error {
-        parts.push(message(error.clone(), cx));
+        )
+        .child(
+            Button::new("tester-reset")
+                .ghost()
+                .small()
+                .label("Clear")
+                .disabled(empty)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.features.seen.clear();
+                    this.features.events.clear();
+                    this.features.held.clear();
+                    cx.notify();
+                })),
+        );
+    let mut parts = vec![toolbar.into_any_element(), capture.into_any_element()];
+    if !this.features.events.is_empty() {
+        let rows = this
+            .features
+            .events
+            .iter()
+            .take(30)
+            .map(|(label, kind)| {
+                h_flex()
+                    .min_h(px(40.))
+                    .gap_4()
+                    .child(div().flex_1().text_sm().child(label.clone()))
+                    .children(kind.map(|kind| {
+                        div()
+                            .text_sm()
+                            .text_color(theme.muted_foreground)
+                            .child(kind)
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+        parts.push(ui::section("Events", rows, cx));
     }
-    if let Some(status) = &this.features.operation {
-        parts.push(message(status.clone(), cx));
+    ui::page("tester", parts).into_any_element()
+}
+
+fn desktop_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
+    use gpui_kit::assets::IconName as I;
+    let prefs = &this.features.preferences;
+    let alerts = prefs.battery_alerts;
+    let battery = ui::section(
+        "Battery",
+        vec![
+            ui::icon_row(
+                I::BellRing,
+                "Low-battery notifications",
+                Switch::new("battery-alerts")
+                    .checked(alerts)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                        this.features.preferences.battery_alerts = *on;
+                        this.features.battery_latched = false;
+                        this.save_preferences(cx);
+                    })),
+            ),
+            ui::icon_row(
+                I::BatteryLow,
+                "Notify at",
+                ui::valued(
+                    Slider::new(&this.features.battery).disabled(!alerts),
+                    format!("{}%", prefs.battery_threshold.clamp(5, 50)),
+                    cx,
+                ),
+            ),
+        ],
+        cx,
+    );
+    let startup = ui::section(
+        "Startup",
+        vec![
+            ui::icon_row(
+                I::PanelTop,
+                "Tray icon",
+                Switch::new("tray-enabled")
+                    .checked(prefs.tray)
+                    .on_click(cx.listener(|this, on: &bool, window, cx| {
+                        this.features.preferences.tray = *on;
+                        this.features.desktop_error = None;
+                        if *on {
+                            this.enable_tray(window, cx);
+                        } else {
+                            this.features.tray = None;
+                        }
+                        this.save_preferences(cx);
+                    })),
+            ),
+            ui::icon_row(
+                I::LogIn,
+                "Open at login",
+                Switch::new("autostart")
+                    .checked(this.features.autostart)
+                    .on_click(cx.listener(|this, on: &bool, _, cx| {
+                        match std::env::current_exe()
+                            .map_err(anyhow::Error::from)
+                            .and_then(|exe| desktop::set_autostart(*on, &exe))
+                        {
+                            Ok(()) => this.features.autostart = *on,
+                            Err(e) => this.features.desktop_error = Some(e.to_string()),
+                        }
+                        cx.notify();
+                    })),
+            ),
+        ],
+        cx,
+    );
+    let mut parts = vec![battery, startup];
+    if let Some(error) = &this.features.desktop_error {
+        parts.push(ui::error(error.clone(), cx));
     }
     ui::page("desktop", parts).into_any_element()
 }
+
 fn host_page(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
+    use gpui_kit::assets::IconName as I;
+    let theme = cx.theme().clone();
     let running = this.features.host_process.is_some();
-    let mut parts = vec![
-        message(
-            "Tap-hold, tap dance, chords, shortcuts, and launch actions run on this computer. Application rules support niri, Sway, Hyprland, X11, or a custom focus command.",
-            cx,
-        ),
-        h_flex()
-            .gap_2()
-            .child(
-                Button::new("host-open")
-                    .outline()
-                    .label("Open configuration")
-                    .disabled(running)
-                    .on_click(cx.listener(|this, _, window, cx| this.host_file(true, window, cx))),
-            )
-            .child(
-                Button::new("host-save")
-                    .outline()
-                    .label("Save configuration")
-                    .disabled(running)
-                    .on_click(cx.listener(|this, _, window, cx| this.host_file(false, window, cx))),
-            )
-            .child(
-                Button::new("host-validate")
-                    .ghost()
-                    .label("Validate")
-                    .on_click(cx.listener(|this, _, _, cx| {
-                        this.validate_host(cx);
-                    })),
-            )
-            .child(div().flex_1())
-            .child(
-                Button::new("host-start-stop")
-                    .outline()
-                    .label(if running {
-                        "Stop remapping"
-                    } else {
-                        "Start remapping"
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        if running {
-                            this.features.host_process = None;
-                            cx.notify();
-                        } else {
-                            this.start_host(window, cx);
-                        }
-                    })),
-            )
-            .into_any_element(),
-        ui::heading("Advanced configuration", cx).into_any_element(),
-        Textarea::new(&this.features.host_editor)
-            .h(px(360.))
-            .disabled(running)
-            .into_any_element(),
-        message(
-            "Replace the example's device path with your event device. Key numbers are Linux input codes; Caps Lock=58, Esc=1, Ctrl=29, Space=57. Commands use an argument list and are never interpreted by a shell.",
-            cx,
-        ),
-    ];
-    if let Some(error) = &this.features.host_error {
-        parts.insert(
-            1,
-            div()
-                .text_sm()
-                .text_color(cx.theme().danger)
-                .child(error.clone())
-                .into_any_element(),
+    let files = h_flex()
+        .gap_2()
+        .child(
+            Button::new("host-open")
+                .outline()
+                .small()
+                .icon(I::FolderOpen)
+                .label("Open")
+                .disabled(running)
+                .on_click(cx.listener(|this, _, window, cx| this.host_file(true, window, cx))),
+        )
+        .child(
+            Button::new("host-save")
+                .outline()
+                .small()
+                .icon(I::Save)
+                .label("Save")
+                .disabled(running)
+                .on_click(cx.listener(|this, _, window, cx| this.host_file(false, window, cx))),
         );
-    } else if let Some(config) = &this.features.host_config {
-        parts.insert(
-            1,
-            message(
-                format!(
-                    "{} devices · {} rules · {} chords{}",
-                    config.devices.len(),
-                    config.rules.len(),
-                    config.chords.len(),
-                    if running {
-                        " · Running"
-                    } else {
-                        " · Validated"
-                    }
-                ),
-                cx,
-            ),
-        );
-    }
-    parts.push(
-        Button::new("host-devices")
-            .ghost()
-            .label("Show available input devices")
-            .on_click(cx.listener(|this, _, _, cx| {
-                match host::linux::devices() {
-                    Ok(devices) => {
-                        this.features.operation = Some(
-                            devices
-                                .iter()
-                                .map(|d| format!("{} — {}", d.path.display(), d.name))
-                                .collect::<Vec<_>>()
-                                .join("\n"),
+    let state: AnyElement = if let Some(error) = &this.features.host_error {
+        div()
+            .flex_1()
+            .min_w_0()
+            .child(ui::error(error.clone(), cx))
+            .into_any_element()
+    } else {
+        let text = match (&this.features.host_config, running) {
+            (_, true) => Some("Running".to_string()),
+            (Some(config), false) => {
+                let count = |n: usize, one: &str, many: &str| {
+                    format!("{n} {}", if n == 1 { one } else { many })
+                };
+                Some(format!(
+                    "Valid with {}, {}, {}",
+                    count(config.devices.len(), "device", "devices"),
+                    count(config.rules.len(), "rule", "rules"),
+                    count(config.chords.len(), "chord", "chords"),
+                ))
+            }
+            _ => None,
+        };
+        div()
+            .flex_1()
+            .min_w_0()
+            .children(text.map(|t| ui::status(t, cx)))
+            .into_any_element()
+    };
+    let run = h_flex()
+        .gap_2()
+        .child(state)
+        .child(
+            Button::new("host-validate")
+                .ghost()
+                .small()
+                .label("Validate")
+                .disabled(running)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.validate_host(cx);
+                })),
+        )
+        .child(if running {
+            Button::new("host-start-stop")
+                .outline()
+                .small()
+                .icon(I::CircleStop)
+                .label("Stop remapping")
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.features.host_process = None;
+                    cx.notify();
+                }))
+        } else {
+            Button::new("host-start-stop")
+                .primary()
+                .small()
+                .icon(I::Play)
+                .label("Start remapping")
+                .on_click(cx.listener(|this, _, window, cx| this.start_host(window, cx)))
+        });
+    let refresh = Button::new("host-devices")
+        .ghost()
+        .small()
+        .icon(gpui_kit::assets::IconName::RefreshCw)
+        .label("Refresh")
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.features.host_devices = input_devices();
+            cx.notify();
+        }));
+    let devices = match &this.features.host_devices {
+        Err(e) => ui::error(e.clone(), cx),
+        Ok(list) if list.is_empty() => ui::placeholder("No input devices", 96., cx),
+        Ok(list) => ui::section(
+            "",
+            list.iter()
+                .enumerate()
+                .map(|(i, (name, path))| {
+                    let copy = path.display().to_string();
+                    h_flex()
+                        .min_h(px(52.))
+                        .py_2()
+                        .gap_4()
+                        .child(div().flex_1().min_w_0().text_sm().truncate().child(
+                            if name.is_empty() {
+                                "Unnamed device".to_string()
+                            } else {
+                                name.clone()
+                            },
+                        ))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_sm()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .child(copy.clone()),
                         )
-                    }
-                    Err(e) => this.features.host_error = Some(e.to_string()),
-                }
-                cx.notify();
-            }))
-            .into_any_element(),
-    );
-    if let Some(status) = &this.features.operation {
-        parts.push(message(status.clone(), cx));
-    }
-    ui::page("host-remapping", parts).into_any_element()
+                        .child(
+                            Button::new(("copy-device", i))
+                                .ghost()
+                                .small()
+                                .icon(I::Copy)
+                                .tooltip("Copy path")
+                                .on_click(cx.listener(move |_, _, window, cx| {
+                                    cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(
+                                        copy.clone(),
+                                    ));
+                                    window.push_notification(Notification::success("Copied"), cx);
+                                })),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
+            cx,
+        ),
+    };
+    ui::page(
+        "host-remapping",
+        vec![
+            ui::heading_row("Configuration", files, cx),
+            Textarea::new(&this.features.host_editor)
+                .h(px(360.))
+                .font_family(theme.mono_font_family.clone())
+                .disabled(running)
+                .into_any_element(),
+            run.into_any_element(),
+            ui::heading_row("Input devices", refresh, cx),
+            devices,
+        ],
+    )
+    .into_any_element()
 }
 
 pub fn picture_controls(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
     let clean = this.baseline.is_some()
         && this.busy.is_none()
         && this.pending().is_ok_and(|v| v.is_empty());
-    let mut rows = vec![
-        h_flex()
-            .py_3()
-            .gap_2()
-            .child(
-                Button::new("pictures-backup")
-                    .outline()
-                    .label("Back up all three pictures")
-                    .disabled(!clean)
-                    .on_click(cx.listener(|this, _, window, cx| this.capture_pictures(window, cx))),
-            )
-            .child(
-                Button::new("pictures-open")
-                    .ghost()
-                    .label("Open picture backup")
-                    .on_click(
-                        cx.listener(|this, _, window, cx| this.open_picture_backup(window, cx)),
-                    ),
-            )
-            .into_any_element(),
-    ];
+    let actions = h_flex()
+        .gap_2()
+        .child(
+            Button::new("pictures-backup")
+                .outline()
+                .small()
+                .icon(gpui_kit::assets::IconName::Download)
+                .label("Back up all")
+                .loading(this.busy == Some(Busy::Capturing))
+                .disabled(!clean)
+                .on_click(cx.listener(|this, _, window, cx| this.capture_pictures(window, cx))),
+        )
+        .child(
+            Button::new("pictures-open")
+                .outline()
+                .small()
+                .icon(gpui_kit::assets::IconName::Upload)
+                .label("Open")
+                .on_click(cx.listener(|this, _, window, cx| this.open_picture_backup(window, cx))),
+        );
+    let mut parts = vec![ui::heading_row("Pictures", actions, cx)];
     if this.features.picture_backup.is_some() {
-        for picture in 0..3 {
-            rows.push(ui::icon_row(
-                gpui_kit::assets::IconName::Image,
-                format!("Picture {}", picture + 1),
-                Button::new(("picture-restore", picture as usize))
-                    .outline()
-                    .small()
-                    .label("Load colours for review")
-                    .disabled(!this.editable())
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.restore_picture(picture, window, cx)
-                    })),
-            ));
-        }
+        parts.push(ui::section(
+            "",
+            (0..3u8)
+                .map(|picture| {
+                    h_flex()
+                        .min_h(px(52.))
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .font_weight(gpui_kit::FontWeight::MEDIUM)
+                                .child(format!("Picture {}", picture + 1)),
+                        )
+                        .child(
+                            Button::new(("picture-restore", picture as usize))
+                                .ghost()
+                                .small()
+                                .label("Restore")
+                                .disabled(!this.editable())
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.restore_picture(picture, window, cx)
+                                })),
+                        )
+                        .into_any_element()
+                })
+                .collect(),
+            cx,
+        ));
     }
-    if let Some(status) = &this.features.operation {
-        rows.push(message(status.clone(), cx));
+    if let Some(error) = &this.features.picture_error {
+        parts.push(ui::error(error.clone(), cx));
     }
-    ui::section("Complete RGB backup", rows, cx)
+    v_flex().gap_3().children(parts).into_any_element()
 }

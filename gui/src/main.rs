@@ -3,6 +3,7 @@ mod app;
 mod board;
 mod desktop;
 mod device;
+mod effects;
 mod features;
 mod log;
 mod pages;
@@ -61,6 +62,13 @@ gpui_kit::assets::icon_assets!(
         BatteryMedium,
         BatteryLow,
         BatteryWarning,
+        BellRing,
+        PanelTop,
+        LogIn,
+        Save,
+        CircleStop,
+        Play,
+        Pause,
     ]
 );
 

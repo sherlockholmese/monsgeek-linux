@@ -102,6 +102,17 @@ fn review_names_key_and_rgb_values_instead_of_hiding_same_counts() {
     );
 }
 #[test]
+fn review_lists_only_the_lighting_fields_that_changed() {
+    let base = snapshot();
+    let mut draft = base.clone();
+    draft.lighting.brightness = if base.lighting.brightness == 1 { 2 } else { 1 };
+    let rows = monsgeek_linux::review::rows(&base, &draft).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].setting, "Lighting");
+    assert_eq!(rows[0].scope.as_deref(), Some("Brightness"));
+    assert!(rows[0].after.ends_with("/4") && !rows[0].after.contains(','));
+}
+#[test]
 fn picture_restore_is_staged_for_the_selected_picture_only() {
     let base = snapshot();
     let backup = monsgeek_linux::pictures::Backup {

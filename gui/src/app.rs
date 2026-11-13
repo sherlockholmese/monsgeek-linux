@@ -194,6 +194,8 @@ pub struct Workbench {
     pub selected: Option<u8>,
     // Lighting
     pub last_rgb: [u8; 3],
+    /// Time base of the lighting preview.
+    pub preview: crate::effects::Clock,
     // Macros
     pub macro_slot: u8,
     pub macro_events: Vec<MacroEvent>,
@@ -647,6 +649,7 @@ impl Workbench {
                 .then(|| std::env::var("M1W_SELECT").ok()?.parse().ok())
                 .flatten(),
             last_rgb: [255; 3],
+            preview: crate::effects::Clock::new(!cx.reduce_motion()),
             macro_slot: 0,
             macro_events: Vec::new(),
             macro_repeat: 1,
@@ -1595,6 +1598,11 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
+/// Firmware revision as the vendor writes it, such as 1.08.
+pub fn firmware_label(revision: u16) -> String {
+    format!("Firmware {:X}.{:02X}", revision >> 8, revision & 0xff)
+}
+
 pub fn first_line(e: &impl std::fmt::Display) -> SharedString {
     let text = e.to_string();
     let line = text.lines().next().unwrap_or_default();
@@ -1617,11 +1625,7 @@ impl Render for Workbench {
         let dark = theme.is_dark();
 
         let status = match (&self.link, &self.baseline) {
-            (_, Some(s)) => format!(
-                "Firmware {:X}.{:02X}",
-                s.usb_revision >> 8,
-                s.usb_revision & 0xff
-            ),
+            (_, Some(s)) => firmware_label(s.usb_revision),
             (Link::Failed(_), None) => "Disconnected".into(),
             _ if reading && self.progress.kind().is_some() => "Reading".into(),
             _ => "Connecting".into(),
@@ -1767,23 +1771,33 @@ impl Render for Workbench {
                         .on_click(cx.listener(|this, _, window, cx| this.discard(window, cx))),
                 )
             })
-            .when(self.draft.is_some() && self.page != Page::Review, |this| {
-                this.child(
+            .when(self.draft.is_some() && count > 0, |this| {
+                let changes = if count == 1 {
+                    "1 change".to_string()
+                } else {
+                    format!("{count} changes")
+                };
+                // Every page leads to review; only review applies.
+                this.child(if self.page == Page::Review {
                     Button::new("apply")
                         .primary()
                         .small()
-                        .label(match count {
-                            0 => "Review changes".to_string(),
-                            1 => "Review 1 change".into(),
-                            n => format!("Review {n} changes"),
-                        })
+                        .label(format!("Apply {changes}"))
                         .loading(applying)
-                        .disabled(count == 0 || self.busy.is_some())
+                        .disabled(self.busy.is_some() || self.features.host_process.is_some())
+                        .on_click(cx.listener(|this, _, window, cx| this.apply(window, cx)))
+                } else {
+                    Button::new("apply")
+                        .primary()
+                        .small()
+                        .label(format!("Review {changes}"))
+                        .loading(applying)
+                        .disabled(self.busy.is_some())
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.page = Page::Review;
                             cx.notify();
-                        })),
-                )
+                        }))
+                })
             });
 
         let body = crate::pages::render(self, window, cx);
@@ -1902,7 +1916,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a headless GPU renderer; writes screenshots to /tmp"]
+    #[ignore = "requires a headless GPU renderer; writes screenshots to $M1W_SHOT_DIR or /tmp"]
     fn bluetooth_warning_screenshots() {
         use gpui_kit::{
             component::{Theme, ThemeMode},
@@ -1973,7 +1987,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a headless GPU renderer; writes screenshots to /tmp"]
+    #[ignore = "requires a headless GPU renderer; writes screenshots to $M1W_SHOT_DIR or /tmp"]
     fn firmware_screenshots() {
         use gpui_kit::size;
         use std::{cell::RefCell, rc::Rc};
@@ -2168,7 +2182,202 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a headless GPU renderer; writes screenshots to /tmp"]
+    #[ignore = "requires a headless GPU renderer; writes screenshots to $M1W_SHOT_DIR or /tmp"]
+    fn board_screenshots() {
+        use gpui_kit::size;
+        let platform = gpui_kit::platform::current_platform(true);
+        let mut context = gpui::HeadlessAppContext::with_platform(
+            platform.text_system(),
+            Arc::new(crate::AppAssets),
+            gpui_platform::current_headless_renderer,
+        );
+        context.update(gpui_kit::init);
+        context.update(crate::use_geist);
+        // (label, page, width, theme, effect, rainbow, option)
+        for (label, page, width, mode, effect, rainbow, option) in [
+            (
+                "wave-dark",
+                Page::Lighting,
+                1240.,
+                ThemeMode::Dark,
+                4,
+                true,
+                0,
+            ),
+            (
+                "wave-light",
+                Page::Lighting,
+                960.,
+                ThemeMode::Light,
+                4,
+                true,
+                0,
+            ),
+            (
+                "static-dark",
+                Page::Lighting,
+                960.,
+                ThemeMode::Dark,
+                1,
+                false,
+                0,
+            ),
+            (
+                "static-light",
+                Page::Lighting,
+                1240.,
+                ThemeMode::Light,
+                1,
+                false,
+                0,
+            ),
+            (
+                "ripple-dark",
+                Page::Lighting,
+                1240.,
+                ThemeMode::Dark,
+                5,
+                true,
+                0,
+            ),
+            (
+                "meteor-dark",
+                Page::Lighting,
+                960.,
+                ThemeMode::Dark,
+                18,
+                false,
+                0,
+            ),
+            (
+                "circle-light",
+                Page::Lighting,
+                960.,
+                ThemeMode::Light,
+                15,
+                false,
+                1,
+            ),
+            (
+                "off-dark",
+                Page::Lighting,
+                960.,
+                ThemeMode::Dark,
+                0,
+                false,
+                0,
+            ),
+            (
+                "picture-dark",
+                Page::Lighting,
+                1240.,
+                ThemeMode::Dark,
+                13,
+                false,
+                0,
+            ),
+            (
+                "picture-light",
+                Page::Lighting,
+                960.,
+                ThemeMode::Light,
+                13,
+                false,
+                0,
+            ),
+            ("keys-dark", Page::Keys, 1240., ThemeMode::Dark, 1, false, 0),
+            (
+                "keys-light",
+                Page::Keys,
+                960.,
+                ThemeMode::Light,
+                1,
+                false,
+                0,
+            ),
+            (
+                "tester-dark",
+                Page::Tester,
+                960.,
+                ThemeMode::Dark,
+                1,
+                false,
+                0,
+            ),
+            (
+                "tester-light",
+                Page::Tester,
+                1240.,
+                ThemeMode::Light,
+                1,
+                false,
+                0,
+            ),
+        ] {
+            let handle = context
+                .open_window(size(px(width), px(820.)), |window, cx| {
+                    Theme::change(mode, Some(window), cx);
+                    let view = cx.new(|cx| {
+                        let mut w = Workbench::build(window, cx);
+                        w.loaded(fixture(), window, cx);
+                        w.page = page;
+                        w.preview = crate::effects::Clock::new(false);
+                        w.last_rgb = [0, 190, 255];
+                        if effect == 13 {
+                            w.edit_onboard(cx, |o| {
+                                for (i, px) in o.rgb.chunks_mut(3).enumerate() {
+                                    let c =
+                                        [[255, 60, 40], [40, 200, 120], [60, 110, 255], [0, 0, 0]];
+                                    px.copy_from_slice(&c[i % 4]);
+                                }
+                            });
+                        } else {
+                            w.edit_light(cx, |l| {
+                                l.mode = effect;
+                                l.rainbow = rainbow;
+                                l.option = option;
+                                l.rgb = [0, 190, 255];
+                            });
+                        }
+                        if page == Page::Keys {
+                            w.set_binding(3, [0, 0, 224, 0], cx);
+                            w.selected = Some(if width > 1000. { 3 } else { keys::KNOB_PRESS });
+                        }
+                        w.sync_controls(window, cx);
+                        if page == Page::Tester {
+                            w.features.testing = true;
+                            w.features.test_event(Some(4), "A".into(), true);
+                            w.features.test_event(Some(22), "S".into(), true);
+                            w.features.test_event(Some(22), "S".into(), false);
+                        }
+                        w
+                    });
+                    cx.new(|cx| gpui_kit::base::Root::new(view, window, cx))
+                })
+                .unwrap();
+            for _ in 0..2 {
+                context.run_until_parked();
+                context.advance_clock(Duration::from_millis(500));
+                context.run_until_parked();
+                context
+                    .update_window(handle.into(), |_, window, cx| {
+                        let _ = window.draw(cx);
+                    })
+                    .unwrap();
+            }
+            context
+                .capture_screenshot(handle.into())
+                .unwrap()
+                .save(format!(
+                    "{}/monsgeek-board-{label}.png",
+                    std::env::var("M1W_SHOT_DIR").unwrap_or_else(|_| "/tmp".into())
+                ))
+                .unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a headless GPU renderer; writes screenshots to $M1W_SHOT_DIR or /tmp"]
     fn feature_screenshots() {
         use gpui_kit::size;
         use std::{cell::RefCell, rc::Rc};
@@ -2191,6 +2400,14 @@ mod tests {
             ("host-error", Page::Host, 960., ThemeMode::Light),
             ("pictures-light", Page::Backups, 960., ThemeMode::Light),
             ("profile-dialog", Page::Profiles, 960., ThemeMode::Dark),
+            ("profiles-empty", Page::Profiles, 760., ThemeMode::Light),
+            ("review-empty", Page::Review, 960., ThemeMode::Dark),
+            ("review-narrow", Page::Review, 760., ThemeMode::Dark),
+            ("tester-light", Page::Tester, 1240., ThemeMode::Light),
+            ("desktop-dark", Page::Desktop, 760., ThemeMode::Dark),
+            ("host-valid", Page::Host, 960., ThemeMode::Light),
+            ("pictures-dark", Page::Backups, 960., ThemeMode::Dark),
+            ("logs-light", Page::Logs, 960., ThemeMode::Light),
         ] {
             let state = Rc::new(RefCell::new(None));
             let handle=context.open_window(size(px(width),px(820.)),|window,cx| {
@@ -2198,7 +2415,10 @@ mod tests {
                 let view=cx.new(|cx| {
                     let mut w=Workbench::build(window,cx);w.loaded(fixture(),window,cx);w.page=page;
                     w.features.profiles=vec!["Coding", "Gaming", "Default", "Long configuration name with a narrow window and all restore options visible"].into_iter().enumerate().map(|(i,name)| (PathBuf::from(format!("/tmp/profile-{i}.json")),monsgeek_linux::profiles::Profile::new(name.into(),fixture()).unwrap())).collect();
-                    if page==Page::Review {w.set_binding(3,[0,0,224,0],cx);w.paint(4,cx);w.edit_light(cx,|l|l.brightness=1);}
+                    if label=="profiles-empty" {w.features.profiles.clear();}
+                    if label=="pictures-dark" {w.features.picture_backup=Some(monsgeek_linux::pictures::Backup{format_version:1,snapshot:fixture(),pictures:vec![fixture().onboard.unwrap().rgb;3]});w.features.picture_error=Some("Backup failed. The keyboard stopped responding.".into());}
+                    if label=="host-valid" {w.validate_host(cx);}
+                    if page==Page::Review && label!="review-empty" {w.set_binding(3,[0,0,224,0],cx);w.paint(4,cx);w.edit_light(cx,|l|l.brightness=1);}
                     if page==Page::Tester {w.features.testing=true;w.features.test_event(Some(4),"A".into(),true);w.features.test_event(Some(224),"Ctrl".into(),true);}
                     if label=="host-error" {w.features.host_error=Some("Cannot read the selected input device. Configure input access and try again.".into());}
                     w
@@ -2229,7 +2449,10 @@ mod tests {
             context
                 .capture_screenshot(handle.into())
                 .unwrap()
-                .save(format!("/tmp/monsgeek-features-{label}.png"))
+                .save(format!(
+                    "{}/monsgeek-features-{label}.png",
+                    std::env::var("M1W_SHOT_DIR").unwrap_or_else(|_| "/tmp".into())
+                ))
                 .unwrap();
         }
     }

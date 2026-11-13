@@ -28,7 +28,7 @@ use monsgeek_linux::{
 use crate::{
     app::{Link, Page, Workbench, hsla},
     board::{Look, OnPick, board},
-    ui,
+    effects, ui,
 };
 
 pub fn render(
@@ -233,7 +233,7 @@ fn segmented(
 
 // ---- Lighting -------------------------------------------------------------
 
-fn lighting(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) -> AnyElement {
+fn lighting(this: &mut Workbench, window: &mut Window, cx: &mut Context<Workbench>) -> AnyElement {
     let Some(light) = this.light() else {
         return div().into_any_element();
     };
@@ -245,22 +245,27 @@ fn lighting(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) -
     let options = keys::effect_options(mode);
     let known = keys::EFFECTS.iter().any(|(m, _)| *m == mode);
 
+    // The board plays the drafted effect. Painted pictures are static.
+    let moving = effects::moves(&light) && known;
+    let playing = this.preview.playing();
+    if moving && playing && window.is_window_active() {
+        window.request_animation_frame();
+    }
+    let now = this.preview.now();
+    let level = f32::from(light.brightness.min(4)) / 4.;
     let rgb = draft.onboard.as_ref().map(|o| o.rgb.clone());
     let glow = |slot: u8| -> Option<gpui_kit::Hsla> {
-        if off || picture {
+        if slot == KNOB_PRESS {
             return None;
         }
-        let a = 0.35 + 0.65 * f32::from(light.brightness) / 4.;
-        if light.rainbow {
-            let x = keys::LAYOUT
-                .iter()
-                .find(|c| c.slot == slot)
-                .map(|c| c.x / keys::LAYOUT_WIDTH)
-                .unwrap_or(1.);
-            Some(gpui_kit::hsla(x * 0.83, 0.85, 0.55, a))
-        } else {
-            Some(hsla(light.rgb).opacity(a))
+        if picture {
+            let i = usize::from(slot) * 3;
+            let color = rgb.as_ref().and_then(|d| d.get(i..i + 3))?;
+            return (level > 0. && color.iter().any(|c| *c > 0))
+                .then(|| hsla([color[0], color[1], color[2]]).opacity(level));
         }
+        let cap = keys::LAYOUT.iter().find(|c| c.slot == slot)?;
+        effects::led(&light, now, cap)
     };
     let pick: Option<OnPick> = can_paint.then(|| {
         let entity = cx.entity();
@@ -272,14 +277,6 @@ fn lighting(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) -
         "light",
         |slot| Look {
             legend: keys::slot_legend(slot).into(),
-            fill: if picture && slot != KNOB_PRESS {
-                rgb.as_ref().map(|d| {
-                    let i = usize::from(slot) * 3;
-                    hsla([d[i], d[i + 1], d[i + 2]])
-                })
-            } else {
-                None
-            },
             glow: glow(slot),
             ..Default::default()
         },
@@ -292,14 +289,38 @@ fn lighting(this: &mut Workbench, _: &mut Window, cx: &mut Context<Workbench>) -
         ui::icon_row(
             gpui_kit::assets::IconName::Sparkles,
             "Effect",
-            div().w(px(150.)).child(
-                Select::new(&this.effect)
-                    .small()
-                    .appearance(false)
-                    .menu_width(px(220.))
-                    .placeholder("Custom effect")
-                    .menu_max_h(px(320.)),
-            ),
+            h_flex()
+                .gap_2()
+                .child(
+                    Button::new("preview")
+                        .ghost()
+                        .small()
+                        .icon(if playing {
+                            gpui_kit::assets::IconName::Pause
+                        } else {
+                            gpui_kit::assets::IconName::Play
+                        })
+                        .tooltip(if playing {
+                            "Pause preview"
+                        } else {
+                            "Play preview"
+                        })
+                        .disabled(!moving)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.preview.toggle();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    div().w(px(150.)).child(
+                        Select::new(&this.effect)
+                            .small()
+                            .appearance(false)
+                            .menu_width(px(220.))
+                            .placeholder("Custom effect")
+                            .menu_max_h(px(320.)),
+                    ),
+                ),
         ),
         ui::icon_row(
             gpui_kit::assets::IconName::Sun,
@@ -1050,10 +1071,10 @@ fn system(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
                     .child(div().text_sm().child(
                         match &image.info().known_release {
                             Some(release) => format!(
-                                "Known original M1W ID{} vendor image {} · exact hash match",
-                                release.device_id, release.version
+                                "Verified vendor image {} for M1W ID{}",
+                                release.version, release.device_id
                             ),
-                            None => "Unrecognized image · its model cannot be checked".into(),
+                            None => "Unrecognized image".into(),
                         },
                     ))
                 })
@@ -1204,12 +1225,8 @@ fn backups(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
     ui::page(
         "backups",
         vec![
+            ui::heading_row("Snapshot", actions, cx),
             crate::features::picture_controls(this, cx),
-            h_flex()
-                .child(ui::heading("Snapshot", cx))
-                .child(div().flex_1())
-                .child(actions)
-                .into_any_element(),
             history,
         ],
     )
@@ -1250,6 +1267,14 @@ fn logs(this: &mut Workbench, cx: &mut Context<Workbench>) -> AnyElement {
             cx,
         ))
         .child(div().flex_1())
+        .child(
+            Button::new("diagnostics-export")
+                .outline()
+                .small()
+                .icon(gpui_kit::assets::IconName::Download)
+                .label("Export diagnostics")
+                .on_click(cx.listener(|this, _, window, cx| this.export_diagnostics(window, cx))),
+        )
         .child(
             Button::new("copy-logs")
                 .outline()
